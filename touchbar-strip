@@ -87,7 +87,6 @@ RED = (0.95, 0.33, 0.30)
 BLUE = (0.30, 0.60, 1.00)
 ICE = (0.33, 0.84, 1.00)          # the fan icon: cool cyan
 EMBER = (1.00, 0.55, 0.30)        # thermometer
-VIOLET = (0.72, 0.56, 1.00)       # RAM
 MINT = (0.40, 0.92, 0.70)         # CPU
 VOLT = (1.00, 0.84, 0.25)         # power
 FONT = "Adwaita Sans"
@@ -1375,6 +1374,15 @@ def heat(value, cool, warm, hot, base):
     return mix(AMBER, RED, (value - warm) / (hot - warm))
 
 
+def load_color(value, calm, warn, full):
+    """Green up to `calm`, yellow at `warn`, red at `full` (battery/Wi-Fi colours, read the other way)."""
+    def mix(a, b, t):
+        return tuple(x + (y - x) * min(1.0, max(0.0, t)) for x, y in zip(a, b))
+    if value <= warn:
+        return mix(GREEN, VOLT, (value - calm) / (warn - calm))
+    return mix(VOLT, RED, (value - warn) / (full - warn))
+
+
 def zone_machine(p, x, w, mid, model):
     """CPU sparkline, temperature + fan, RAM, Wi-Fi, battery and power slots (charge %, watts, AC or battery)."""
     m = model["machine"]
@@ -1404,7 +1412,7 @@ def zone_machine(p, x, w, mid, model):
                color=RED if t > 85 else AMBER if t > 70 else TEXT)
     x += 72
     ram = m.mem()
-    p.label(x, mid - 11, "\U000f035b", heat(ram, 50, 75, 92, VIOLET), slot_flash(model, "memory") or "RAM")
+    p.label(x, mid - 11, "\U000f035b", load_color(ram, 50, 75, 92), slot_flash(model, "memory") or "RAM")
     p.text(x, mid + 10, f"{ram:.0f}%", size=17, font=MONO)
     x += 70
     sig = m.wifi()
