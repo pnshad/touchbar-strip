@@ -167,6 +167,10 @@ DEFAULTS = {
     # After a screen rain pass (omarchy-mac-kit-extras), a red PROCESSING then a green REFRESHED
     # sign; off unless you installed the extras' rain pass
     "refresh_sign": False,
+    # The hwdeck wall (all six views open, by the graph tap or the extras' idle wall): hide
+    # Omarchy's top bar while it is up, so the views can use the whole screen; the bar comes
+    # back when the wall closes, however it was closed
+    "wall": {"hide_bar": False},
     "agent": {"provider": "claude-code", "projects": None, "open": "tmux-attach", "progress": False,
               "command": None},
     "helpers": {
@@ -246,6 +250,8 @@ def validate(cfg):
         bad.append("oled_care.orbit and oled_care.dark_on_dpms must be true or false")
     if not isinstance(cfg.get("refresh_sign"), bool):
         bad.append("refresh_sign must be true or false")
+    if not isinstance(cfg.get("wall"), dict) or not isinstance(cfg["wall"].get("hide_bar"), bool):
+        bad.append("wall.hide_bar must be true or false")
     if cfg["agent"].get("provider") not in ("claude-code", "command"):
         bad.append('agent.provider must be "claude-code" or "command"')
     if cfg["agent"].get("provider") == "command" and not cfg["agent"].get("command"):
@@ -1519,9 +1525,47 @@ def toggle_wall():
     if not missing:
         for v in WALL:
             close_window(app_id(f"hwdeck-{v}"))
+        threading.Timer(0.5, sync_wall_bar).start()
         return
     for v in missing:
         run_control(hwdeck_view(v))
+    threading.Timer(1.5, sync_wall_bar).start()     # the bar follows the wall soon, not in 2 s
+
+
+WALL_BAR_MARK = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "touchbar-strip" / "wall-hid-bar"
+OMARCHY_BAR_OFF = HOME / ".local" / "state" / "omarchy" / "toggles" / "bar-off"
+
+
+def sync_wall_bar():
+    """wall.hide_bar: while all six hwdeck views are open, Omarchy's bar is hidden (its own
+    bar-off toggle, so nothing else is touched); once any of them closes, the bar comes back.
+    Only a bar this hid is brought back (a marker file says so), so a bar the user switched off
+    stays off, and a marker left over from a crash is cleared on the next check."""
+    hide = CFG.get("wall", {}).get("hide_bar") and OMARCHY_BAR_OFF.parent.parent.is_dir()
+    try:
+        classes = {c.get("class") for c in json.loads(subprocess.run(
+            ["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2,
+            env=desktop_env()).stdout or "[]")}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return
+    wall_up = all(app_id(f"hwdeck-{v}") in classes for v in WALL)
+    sync = ["omarchy-shell", "-q", "omarchy.bar", "syncHidden"]
+    if hide and wall_up and not OMARCHY_BAR_OFF.exists():
+        try:
+            OMARCHY_BAR_OFF.parent.mkdir(parents=True, exist_ok=True)
+            OMARCHY_BAR_OFF.touch()
+            WALL_BAR_MARK.parent.mkdir(parents=True, exist_ok=True)
+            WALL_BAR_MARK.touch()
+        except OSError:
+            return
+        run_control(sync)
+    elif WALL_BAR_MARK.exists() and not (hide and wall_up):
+        try:
+            OMARCHY_BAR_OFF.unlink(missing_ok=True)
+            WALL_BAR_MARK.unlink(missing_ok=True)
+        except OSError:
+            return
+        run_control(sync)
 
 
 def toggle_view(view):
@@ -2098,6 +2142,7 @@ def run():
         now = time.time()
         if now >= next_sample:
             load_config()
+            sync_wall_bar()
             machine.sample()
             agent.sample()
             model["agent_status"] = agent.status()
@@ -2383,6 +2428,7 @@ def check():
     print(f"oled     orbit {'on' if oc.get('orbit') else 'off'}, dark while the screen is off "
           f"{'on' if oc.get('dark_on_dpms') else 'off'}")
     sig = refresh_signal()
+    print(f"wall     hide the bar while the wall is up: {'on' if CFG.get('wall', {}).get('hide_bar') else 'off'}")
     print(f"refresh  sign {'on (' + str(sig) + ', written by omarchy-mac-kit-extras omk-rainpass)' if CFG.get('refresh_sign') else 'off'}")
     print(f"dials    hints {'on' if CFG['dials'].get('hints', True) else 'off'}, room loudness (mic) "
           f"{'on' if CFG['dials'].get('room_loudness') else 'off'}")

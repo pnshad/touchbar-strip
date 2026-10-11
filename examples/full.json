@@ -80,5 +80,8 @@
     "launch_tui": "omarchy-launch-or-focus-tui",
     "terminal": null,
     "charge_state": "/var/lib/omk-battery-limit/limit"
+  },
+  "wall": {
+    "hide_bar": true
   }
 }

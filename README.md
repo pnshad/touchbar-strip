@@ -30,6 +30,7 @@ esc | 14:22 label | ▦ agent task / last step | CPU temp+fan RAM wifi battery p
   and goes black while the screen is off (`dark_on_dpms`; a touch wakes it for 15 s). Each can
   be turned off.
 - **Refresh sign** (`refresh_sign`, off by default): a red PROCESSING then a green REFRESHED
+- `wall.hide_bar` (default `false`): while all six hwdeck views are open (the wall), Omarchy's top bar hides so the views fill the screen; it comes back as soon as any view closes. Pair it with the extras' grid set to `top = 0`.
   after a screen rain pass. Only useful with the rain pass from
   [omarchy-mac-kit-extras](https://github.com/pnshad/omarchy-mac-kit-extras).
 
