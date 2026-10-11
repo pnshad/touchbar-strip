@@ -1,0 +1,2438 @@
+#!/usr/bin/env python3
+"""touchbar-strip - a status strip renderer for the T1 Touch Bar (MacBook Pro 2016-2017).
+
+Speaks t1bridge's Touch Bar hardware IPC v1 (t1bridge docs/interfaces.md) and is selected as the
+renderer by linking ~/.config/t1bridge/renderer at this file. If it exits, t1bridge's launcher
+falls back to the built-in renderer once, so a crash never leaves the bar dead.
+
+Layout, 2170x60:  Esc | clock | agent (a coding agent's state, task and last step) |
+                  [task progress] | machine | screen, keyboard, volume dials | lock key
+Fn held:          Esc | F1 .. F12          (same 13 slots as the stock bar)
+Lock screen:      a black bar and the fingerprint key (no Cancel, never a new verify)
+
+Everything a slot does on tap or hold comes from ~/.config/touchbar-strip/config.json
+(re-read every 2 s): a built-in action name, "sh:<command>", or null. See README.md.
+
+Python standard library plus pycairo and PyGObject (Pango).
+  touchbar-strip --preview out.png   one frame, no hardware
+  touchbar-strip --check             the configured actions and whether their helpers exist
+"""
+import array
+import copy
+import fcntl
+import json
+import math
+import mmap
+import os
+import random
+import re
+import selectors
+import shlex
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import cairo
+    import gi
+
+    gi.require_version("Pango", "1.0")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Pango, PangoCairo  # noqa: E402
+except (ImportError, ValueError) as _gfx_error:     # --check works without them
+    cairo = None
+    GFX_ERROR = _gfx_error
+else:
+    GFX_ERROR = None
+
+SOCKET_PATH = "/run/t1bridge/touchbar.sock"
+TOUCH_ID_STATE = Path("/run/t1bridge/touch-id-state.json")
+HOME = Path.home()
+CONFIG = Path(os.environ.get("TOUCHBAR_STRIP_CONFIG") or HOME / ".config" / "touchbar-strip" / "config.json")
+
+# --- wire ------------------------------------------------------------------------------------
+MAGIC, MAJOR, MINOR = b"T1HW", 1, 1
+HEADER = struct.Struct("<4sHHII")
+HELLO, REGISTER, SUBMIT, TAP, CANCEL_TOUCH_ID = 0x0001, 0x0002, 0x0003, 0x0004, 0x0007
+HELLO_ACK, ACK, ERROR, FRAME_RELEASED, INPUT_FRAME = 0x8001, 0x8002, 0x8003, 0x9001, 0x9002
+# sealed memfd frames, input frames, typed key taps, Touch ID cancellation: the base 0x27 set
+FEATURES = 0x01 | 0x02 | 0x04 | 0x20
+KEY_ESC = 1
+KEY_F = [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88]  # F1..F12
+BUFFER_ID = 1
+
+# --- look --------------------------------------------------------------------------------------
+BG = (0, 0, 0)
+PLATE = (0.208, 0.208, 0.208)
+PLATE_DIAL = (0.13, 0.13, 0.14)
+SOFT = (0.62, 0.62, 0.62)           # the part of a dial's arc below its hint
+HINT = (0.47, 0.52, 0.60)           # muted slate: the light sensor's suggested level on a dial
+HINT_DOT = (0.62, 0.72, 0.92)       # the suggestion dot itself, a little brighter than the slate
+STRONG = (1.0, 1.0, 1.0)            # strong white: a dial at max
+LOCKY = (1.0, 0.78, 0.25)           # the lock key's yellow (lock, arrow), the screen dial's first amber
+PRESSED = (0.298, 0.298, 0.298)     # stock pressed 76,76,76
+TEXT = (0.949, 0.949, 0.949)        # stock label 242
+DIM = (0.55, 0.55, 0.57)
+GREEN = (0.26, 0.80, 0.45)
+AMBER = (0.98, 0.70, 0.20)
+RED = (0.95, 0.33, 0.30)
+BLUE = (0.30, 0.60, 1.00)
+ICE = (0.33, 0.84, 1.00)          # the fan icon: cool cyan
+EMBER = (1.00, 0.55, 0.30)        # thermometer
+VIOLET = (0.72, 0.56, 1.00)       # RAM
+MINT = (0.40, 0.92, 0.70)         # CPU
+VOLT = (1.00, 0.84, 0.25)         # power
+FONT = "Adwaita Sans"
+MONO = "JetBrainsMono Nerd Font"     # replaced by config "font" (see apply_font)
+SLOTS = 13          # Esc + F1..F12, as the stock bar
+ESC_W = 140
+GAP = 8
+
+# Right-hand controls: the exact commands Omarchy binds to the keyboard's media keys
+# (/usr/share/omarchy/default/hypr/bindings/media.lua), so they show the same OSD.
+# Darker/brighter read from the icon alone: dim vs full sun, a dimmed outline keyboard vs a
+# bright filled one.
+# (name, icon, sub-label, command, repeats while held, group)
+CONTROLS = [
+    ("bright-", "\U000f00de", "", ["omarchy-brightness-display", "5%-"], True, 0),
+    ("bright+", "\U000f00e0", "", ["omarchy-brightness-display", "+5%"], True, 0),
+    ("kbd-", "\U000f097b", "", ["omarchy-brightness-keyboard", "down"], True, 1),
+    ("kbd+", "\U000f030c", "", ["omarchy-brightness-keyboard", "up"], True, 1),
+    ("vol-", "\U000f057f", "", ["omarchy-audio-output-volume", "lower"], True, 2),
+    ("vol+", "\U000f057e", "", ["omarchy-audio-output-volume", "raise"], True, 2),
+    ("mute", "\U000f0581", "", ["omarchy-audio-output-volume", "mute-toggle"], False, 2),
+]
+# Drawn as three ring dials (the ring filled to the live level) and a lock key. No − / +: slide a
+# finger across a dial to set its level, left edge 0, right edge 100 (see set_level). On the
+# backlights a tap goes to the light sensor's suggestion, a double tap to max, a hold to off; a
+# hold on volume mutes (CONTROLS[6]'s command) and turns the dial red. The lock key shows a lock
+# while the session is open (tap locks) and a fingerprint while it is locked.
+DIAL_W, MUTE_W, DIAL_GAP = 96, 58, 8
+DIALS = [("screen", "\U000f00e0", (1.0, 0.78, 0.25)), ("kbd", "\U000f030c", (0.33, 0.84, 1.0)),
+         ("vol", "\U000f057e", (0.72, 0.56, 1.0))]
+ORBIT_EVERY = 120
+ORBIT = [(0, 0), (1, 0), (2, 0), (2, 1), (1, 1), (0, 1), (-1, 1), (-1, 0), (-2, 0), (-2, -1),
+         (-1, -1), (0, -1)]
+DIAL_EVERY = 0.06       # at most one level change per 60 ms while sliding
+REPEAT_DELAY, REPEAT_EVERY = 0.40, 0.12
+DIAL_MOVE, DOUBLE_TAP = 10, 0.35   # px before a touch is a slide; s (hold times: config)
+ICON_LOCK, ICON_FINGER, ICON_OPEN = "\U000f033e", "\U000f0237", "\U000f033f"
+REFRESH_PROC, REFRESH_S = 1.5, 3.6   # after a screen rain pass: red PROCESSING, then green REFRESHED, then the strip
+ICON_REFRESH = "\U000f0450"
+SUDO_BLINK = 0.8        # a Touch ID request (sudo): the fingerprint key blinks once (0.8 s on, 0.8 off)
+UNLOCK_S = 1.5          # the unlock: LOCKED scrambles into a green UNLOCKED, then the strip
+DECODE_STEP = 0.09      # each letter of the sign settles this long after the one before
+KATAKANA = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
+SPIN_FPS = 20      # animated icons; 2 turns/s = 36°/frame, under the fan blades' alias
+
+
+def log(msg):
+    print(f"touchbar-strip: {msg}", file=sys.stderr, flush=True)
+
+
+# --- config ----------------------------------------------------------------------------------
+# The defaults are the neutral profile (config.example.json is the same). Nothing here needs
+# root to display; the holds that need a root helper flash "needs setup" when it is missing.
+DEFAULTS = {
+    "zones": ["clock", "agent", "machine"],
+    "hold_seconds": 0.8,            # a slot's hold
+    "dial_hold_seconds": 0.6,       # a dial's hold: backlight off / mute
+    "lock_hold_seconds": 0.6,       # the lock key's hold
+    "font": "JetBrainsMono Nerd Font",
+    "app_id_prefix": "org.omk",     # window classes: <prefix>.hwdeck-<view>, <prefix>.claude
+    "clock": {"timezone": None, "label": None, "hour_mark": None},
+    "slots": {
+        "graph":   {"tap": "wall", "hold": None},
+        "cpu":     {"tap": "hwdeck:cpu", "hold": "cpu-boost"},
+        "thermal": {"tap": "hwdeck:thermal", "hold": "fans-max"},
+        "memory":  {"tap": "hwdeck:memory", "hold": "mem-trim"},
+        "wifi":    {"tap": "hwdeck:network", "hold": "wifi-toggle"},
+        "battery": {"tap": "hwdeck:battery", "hold": "charge-limit"},
+        "power":   {"tap": "hwdeck:power", "hold": "lid-mode"},
+        "lock":    {"tap": "lock", "hold": None},
+    },
+    "dials": {"hints": True, "room_loudness": False},
+    "lock": {"key": True, "screen_sign": "matrix"},
+    # OLED care (protects the panel, costs nothing): the picture drifts a pixel or two every two
+    # minutes (orbit), and the bar goes black while the laptop's own screen is off (dark_on_dpms)
+    "oled_care": {"orbit": True, "dark_on_dpms": True},
+    # After a screen rain pass (omarchy-mac-kit-extras), a red PROCESSING then a green REFRESHED
+    # sign; off unless you installed the extras' rain pass
+    "refresh_sign": False,
+    "agent": {"provider": "claude-code", "projects": None, "open": "tmux-attach", "progress": False,
+              "command": None},
+    "helpers": {
+        "hw": "omk-hw",
+        "smc_power": "/run/omk-smc-power.json",
+        "lid": "omk-lid",
+        "lid_state": "~/.config/omk/lid-mode",
+        "rainpass": "omk-rainpass",
+        "refresh_signal": "omk-refreshed",
+        "hwdeck": "hwdeck",
+        "lock_cmd": "omarchy-system-lock",
+        "launch_tui": "omarchy-launch-or-focus-tui",
+        "terminal": None,
+        "charge_state": "/var/lib/omk-battery-limit/limit",
+    },
+}
+SLOT_NAMES = list(DEFAULTS["slots"])
+BUILTINS = {"wall", "cpu-boost", "fans-max", "mem-trim", "wifi-toggle", "charge-limit", "lid-mode",
+            "lock", "lock-rain", "agent-open", "none"}
+HWDECK_VIEWS = {"cpu", "memory", "fans", "battery", "power", "network", "thermal"}
+# Which kit module provides what a built-in needs, for the "needs setup" journal line
+NEEDS = {"fans-max": ("hw", "omarchy-mac-kit module 'fans-ram'"),
+         "mem-trim": ("hw", "omarchy-mac-kit module 'fans-ram'"),
+         "lid-mode": ("lid", "omarchy-mac-kit module 'lid'"),
+         "lock-rain": ("rainpass", "omarchy-mac-kit-extras module 'screensaver'"),
+         "charge-limit": (None, "omarchy-mac-kit module 'battery-limit'")}
+ZONE_ALIASES = {"builder": "agent"}     # the zone's old name, still read
+
+CFG = copy.deepcopy(DEFAULTS)
+_cfg_seen = (None, None)                # (mtime, size) of the file last read, or a problem
+_cfg_said = set()
+
+
+def _merge(base, over):
+    out = copy.deepcopy(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _say_once(msg):
+    if msg not in _cfg_said:
+        _cfg_said.add(msg)
+        log(msg)
+
+
+def config_unsafe(path):
+    """Why a config file must not be used, or None. It holds sh: commands that run as you, so
+    it, and the folder it is in, must be yours and not writable by group or others."""
+    uid = os.getuid()
+    for f in (path, path.parent):
+        st = f.stat()
+        if st.st_uid != uid:
+            return f"{f} is not owned by you"
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return f"{f} is writable by group or others (chmod go-w)"
+    return None
+
+
+def validate(cfg):
+    """Problems in a merged config, as a list of strings (empty = good)."""
+    bad = []
+    zones = cfg.get("zones")
+    if (not isinstance(zones, list) or len(set(zones)) != len(zones)
+            or not all(z in ZONE_DRAW for z in zones)):
+        bad.append(f"zones must be a list from {sorted(ZONE_DRAW)}")
+    for k in ("hold_seconds", "dial_hold_seconds", "lock_hold_seconds"):
+        if not isinstance(cfg.get(k), (int, float)) or not 0.2 <= cfg[k] <= 5:
+            bad.append(f"{k} must be a number of seconds, 0.2-5")
+    if cfg["lock"].get("screen_sign") not in ("matrix", "off"):
+        bad.append('lock.screen_sign must be "matrix" or "off"')
+    oc = cfg.get("oled_care")
+    if not isinstance(oc, dict) or not all(isinstance(oc.get(k), bool) for k in ("orbit", "dark_on_dpms")):
+        bad.append("oled_care.orbit and oled_care.dark_on_dpms must be true or false")
+    if not isinstance(cfg.get("refresh_sign"), bool):
+        bad.append("refresh_sign must be true or false")
+    if cfg["agent"].get("provider") not in ("claude-code", "command"):
+        bad.append('agent.provider must be "claude-code" or "command"')
+    if cfg["agent"].get("provider") == "command" and not cfg["agent"].get("command"):
+        bad.append('agent.provider "command" needs agent.command')
+    tz = cfg["clock"].get("timezone")
+    if tz:
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz)
+        except Exception:                       # noqa: BLE001 - any failure is a bad zone
+            bad.append(f"clock.timezone {tz!r} is not a known time zone")
+    for name, slot in cfg.get("slots", {}).items():
+        if name not in SLOT_NAMES or not isinstance(slot, dict):
+            bad.append(f"slots.{name}: unknown slot (slots are {', '.join(SLOT_NAMES)})")
+    return bad
+
+
+def merged_config(user):
+    """The defaults with a user config laid over them (old zone names read as new ones)."""
+    user = dict(user)
+    if isinstance(user.get("zones"), list):
+        user["zones"] = [ZONE_ALIASES.get(z, z) for z in user["zones"]]
+    return _merge(DEFAULTS, user)
+
+
+def load_config(force=False):
+    """Re-read the config when it changed; any problem keeps the defaults (logged once)."""
+    global CFG, _cfg_seen
+    try:
+        st = CONFIG.stat()
+    except FileNotFoundError:
+        if _cfg_seen != ("missing", None):
+            CFG, _cfg_seen = copy.deepcopy(DEFAULTS), ("missing", None)
+            apply_font()
+        return CFG
+    except OSError as e:
+        _say_once(f"config ignored: {e}")
+        return CFG
+    key = (st.st_mtime, st.st_size)
+    if key == _cfg_seen and not force:
+        return CFG
+    _cfg_seen = key
+    try:
+        unsafe = config_unsafe(CONFIG)
+        if unsafe:
+            raise ValueError(f"refused: {unsafe}")
+        user = json.loads(CONFIG.read_text())
+        if not isinstance(user, dict):
+            raise ValueError("the top level must be an object")
+        merged = merged_config(user)
+        problems = validate(merged)
+        if problems:
+            raise ValueError("; ".join(problems))
+    except (OSError, ValueError) as e:
+        _say_once(f"config ignored, using the defaults: {e}")
+        CFG = copy.deepcopy(DEFAULTS)
+    else:
+        CFG = merged
+    apply_font()
+    return CFG
+
+
+def apply_font():
+    """The icon font from the config, or a plain monospace when it is not installed (icons
+    then show as boxes; numbers and text still read)."""
+    global MONO
+    want = CFG.get("font") or DEFAULTS["font"]
+    if cairo is None:
+        MONO = want
+        return
+    try:
+        families = {f.get_name() for f in PangoCairo.FontMap.get_default().list_families()}
+    except Exception:                           # noqa: BLE001 - keep the configured name
+        families = {want}
+    if want in families:
+        MONO = want
+    else:
+        _say_once(f"font {want!r} is not installed; using monospace (icons will not show)")
+        MONO = "monospace"
+
+
+def slot_action(slot, kind):
+    """The configured tap or hold action of a slot: a string, or None for no action."""
+    a = (CFG["slots"].get(slot) or {}).get(kind)
+    return None if a in (None, "", "none") else a
+
+
+def action_problem(action):
+    """Why an action string is not runnable as written, or None."""
+    if action is None:
+        return None
+    if not isinstance(action, str):
+        return "not a string"
+    if action.startswith("sh:"):
+        return None if action[3:].strip() else "empty sh: command"
+    if action.startswith("hwdeck:"):
+        return None if action[7:] in HWDECK_VIEWS else f"unknown hwdeck view {action[7:]!r}"
+    return None if action in BUILTINS else "unknown action"
+
+
+def helper(name):
+    """A helper's absolute path from config "helpers", or None when it is not there. A bare
+    name is looked up on the session's PATH."""
+    v = CFG["helpers"].get(name)
+    if not v:
+        return None
+    v = os.path.expanduser(v)
+    if "/" in v:
+        return v if os.path.isfile(v) and os.access(v, os.X_OK) else None
+    return shutil.which(v, path=desktop_env().get("PATH"))
+
+
+def helper_file(name):
+    """A helper path that is a file, not a program (state files), with ~ expanded."""
+    v = CFG["helpers"].get(name)
+    return Path(os.path.expanduser(v)) if v else None
+
+
+def app_id(what):
+    return f"{CFG.get('app_id_prefix') or DEFAULTS['app_id_prefix']}.{what}"
+
+
+def refresh_signal():
+    v = CFG["helpers"].get("refresh_signal") or DEFAULTS["helpers"]["refresh_signal"]
+    v = os.path.expanduser(v)
+    return Path(v) if "/" in v else \
+        Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / v
+
+
+# --- data ------------------------------------------------------------------------------------
+class Machine:
+    """CPU history, temperature, memory and battery from /proc and /sys."""
+
+    def __init__(self):
+        self.cpu = deque([0.0] * 60, maxlen=60)
+        self._last = None
+        self.fan_pct, self.fan_frac, self.charging = None, 0.0, False
+        self.levels = {}
+        self.hints = {}
+
+    def sample(self):
+        with open("/proc/stat") as f:
+            vals = [int(v) for v in f.readline().split()[1:]]
+        idle, total = vals[3] + vals[4], sum(vals)
+        if self._last:
+            dt, di = total - self._last[1], idle - self._last[0]
+            self.cpu.append(0.0 if dt <= 0 else 100.0 * (1 - di / dt))
+        self._last = (idle, total)
+        fan = self.fan()
+        self.fan_pct, self.fan_frac = fan if fan else (None, 0.0)
+        self.read_levels()
+        self.charging = self.battery()[1] == "Charging"
+
+    @staticmethod
+    def temp():
+        best = None
+        for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+            try:
+                if (hw / "name").read_text().strip() != "coretemp":
+                    continue
+                for t in hw.glob("temp*_input"):
+                    v = int(t.read_text()) / 1000
+                    best = v if best is None else max(best, v)
+            except (OSError, ValueError):
+                continue
+        return best
+
+    @staticmethod
+    def fan():
+        """Busiest fan: (% of its own maximum RPM, 0-1 position between its min and max RPM)."""
+        best = None
+        for f in Path("/sys/devices/platform/applesmc.768").glob("fan*_input"):
+            try:
+                rpm = int(f.read_text())
+                top = int(f.with_name(f.name.replace("input", "max")).read_text())
+                low = int(f.with_name(f.name.replace("input", "min")).read_text())
+            except (OSError, ValueError):
+                continue
+            if top > low:
+                level = (100.0 * rpm / top, min(1.0, max(0.0, (rpm - low) / (top - low))))
+                best = level if best is None or level > best else best
+        return best
+
+    def read_levels(self):
+        """Screen and keyboard backlight and output volume as 0-1, and whether output is muted."""
+        lv = {}
+        for key, path in (("screen", "/sys/class/backlight/*"), ("kbd", "/sys/class/leds/*kbd_backlight*")):
+            for d in Path("/").glob(path.lstrip("/")):
+                try:
+                    lv[key] = int((d / "brightness").read_text()) / max(1, int((d / "max_brightness").read_text()))
+                except (OSError, ValueError):
+                    pass
+                break
+        try:
+            out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True,
+                                 text=True, timeout=2, env=desktop_env()).stdout
+            lv["vol"] = min(1.0, float(out.split()[1]))
+            lv["muted"] = "MUTED" in out
+        except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+            pass
+        self.levels = lv
+        self.read_light()
+
+    def read_light(self):
+        if not CFG["dials"].get("hints", True):
+            self.hints = {}
+            return
+        self._read_light()
+
+    def _read_light(self):
+        """Ambient light (lux) from the ALS, smoothed over ~10 s, and the levels it suggests: the
+        screen brighter in a brighter room, the keyboard light the other way round. Hints only;
+        nothing is changed."""
+        try:
+            lux = float(next(Path("/sys/bus/iio/devices").glob("iio:device*/in_illuminance_raw"))
+                        .read_text())
+        except (StopIteration, OSError, ValueError):
+            self.hints = {}
+            return
+        prev = getattr(self, "_lux", None)
+        self._lux = lux if prev is None else prev + (lux - prev) * 0.2     # 2 s samples, ~10 s
+        g = math.log10(self._lux + 1)
+        self.hints = {"screen": min(1.0, max(0.15, 0.15 + 0.30 * g)),
+                      "kbd": 0.0 if self._lux > 200 else min(0.7, max(0.0, 1.0 - 0.45 * g))}   # dark room: 70 %, not max
+
+    def system_watts(self):
+        """(watts, what it covers). Best first: the SMC's own whole-system reading (PSTR, published
+        by a root SMC reader at helpers.smc_power, AC or battery alike); else the battery's
+        discharge on battery; else the CPU package from RAPL when readable; else (None, "power")."""
+        try:
+            smc = json.loads(helper_file("smc_power").read_text())
+            if time.time() - smc["t"] < 10:
+                for key, scope in (("PSTR", "system"), ("PDTR", "adapter")):
+                    if smc["watts"].get(key, 0) > 0.3:
+                        return smc["watts"][key], scope
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        except AttributeError:                  # no smc_power configured
+            pass
+        w = self.watts()
+        if w is not None and w < -0.5:
+            return -w, "system"
+        rapl = Path("/sys/class/powercap/intel-rapl:0/energy_uj")
+        try:
+            e, t = int(rapl.read_text()), time.monotonic()
+        except (OSError, ValueError):
+            return None, "power"
+        last, self._rapl = getattr(self, "_rapl", None), (e, t)
+        if not last or t - last[1] > 30 or e < last[0]:
+            return getattr(self, "_rapl_w", None), "cpu pkg"
+        self._rapl_w = (e - last[0]) / 1e6 / (t - last[1])
+        return self._rapl_w, "cpu pkg"
+
+    @staticmethod
+    def on_ac():
+        try:
+            return Path("/sys/class/power_supply/ADP1/online").read_text().strip() == "1"
+        except OSError:
+            return False
+
+    @staticmethod
+    def watts():
+        """Battery power in watts: positive while charging, negative while discharging, or None."""
+        b = Path("/sys/class/power_supply/BAT0")
+        try:
+            w = int((b / "current_now").read_text()) * int((b / "voltage_now").read_text()) / 1e12
+            status = (b / "status").read_text().strip()
+        except (OSError, ValueError):
+            return None
+        return -abs(w) if status == "Discharging" else abs(w)
+
+    @staticmethod
+    def mem():
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":")
+                info[k] = int(v.split()[0])
+        return 100.0 * (1 - info["MemAvailable"] / info["MemTotal"])
+
+    @staticmethod
+    def battery():
+        """(charge %, status). charge_now / charge_full, as Omarchy shows it: BAT0/capacity divides
+        by the design capacity and reads ~11 points low on this worn battery."""
+        b = Path("/sys/class/power_supply/BAT0")
+        try:
+            pct = 100 * int((b / "charge_now").read_text()) / int((b / "charge_full").read_text())
+            return min(100, round(pct)), (b / "status").read_text().strip()
+        except (OSError, ValueError, ZeroDivisionError):
+            return None, ""
+
+    @staticmethod
+    def wifi():
+        """Wi-Fi signal as 0-100 (2 x (dBm + 100), NetworkManager's scale), or None when no
+        wireless link is up."""
+        try:
+            for line in Path("/proc/net/wireless").read_text().splitlines()[2:]:
+                dbm = float(line.split()[3].rstrip("."))
+                return max(0, min(100, round(2 * (dbm + 100))))
+        except (OSError, IndexError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def charge_limit():
+        """The charge hold (applesmc's BCLM knob, from a patched driver), or 100 when there is none."""
+        try:
+            return int(Path("/sys/devices/platform/applesmc.768/charge_control_end_threshold")
+                       .read_text())
+        except (OSError, ValueError):
+            return 100
+
+
+class ClaudeCode:
+    """The `claude-code` agent provider: Claude Code sessions on this machine (their processes and
+    transcripts under ~/.claude/projects), else the newest commit across agent.projects."""
+
+    def __init__(self):
+        self._cpu = {}
+        self.sessions = 0
+        self.busy = False
+        self.commit = None
+        self._commit_at = 0.0
+        self.work = None
+        self.waiting = False
+
+    def sample(self):
+        sessions, busy, seen, cwds, children = 0, False, {}, [], False
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                cmd = (p / "cmdline").read_bytes().split(b"\0")
+                if not cmd or not cmd[0].endswith(b"/claude") or b"remote-control" in cmd:
+                    continue
+                fields = (p / "stat").read_text().rsplit(")", 1)[1].split()
+                ticks = int(fields[11]) + int(fields[12])
+            except (OSError, IndexError, ValueError):
+                continue
+            sessions += 1
+            seen[p.name] = ticks
+            if ticks - self._cpu.get(p.name, ticks) > 5:   # >5 ticks in a 2 s sample
+                busy = True
+            try:
+                cwds.append(os.readlink(p / "cwd"))
+                if (p / "task" / p.name / "children").read_text().strip():
+                    children = True
+            except OSError:
+                pass
+        self._cpu, self.sessions, self.busy = seen, sessions, busy
+        self.work = current_work(cwds)
+        # Waiting for you: no CPU, and the newest transcript ends on a tool call with no result
+        # yet that is a question to you, or that has no process running (a permission prompt).
+        # A pending call with a child process is a long command still running: working.
+        pending = pending_tool(self.work[5]) if self.work else None
+        self.waiting = bool(sessions and not busy and pending
+                            and (pending in ASKS or not children))
+        if sessions and not busy and pending and not self.waiting:
+            self.busy = True
+        if time.time() - self._commit_at > 60:
+            self._commit_at = time.time()
+            self.commit = self._newest_commit()
+
+    def status(self):
+        """The provider interface: what the agent zone draws."""
+        state = "none" if self.sessions == 0 else "waiting" if self.waiting else \
+            "working" if self.busy else "idle"
+        out = {"state": state, "count": self.sessions, "task": "", "step": "", "progress": None}
+        if self.sessions and self.work and self.work[0]:
+            task, step, started, updated, prog = self.work[:5]
+            out["task"] = task
+            out["step"] = f"{since(updated)} · {step}" if step else \
+                f"started {ago(time.time() - started)} ago"
+            s = prog.summary()
+            if s:
+                out["progress"], out["active"] = [s[0], s[1]], s[2]
+            out["steps"], out["started"] = prog.steps, started
+        elif self.commit:
+            ts, repo, branch, subject = self.commit
+            out["task"] = f"{repo} · {branch} · {ago(time.time() - ts)} ago"
+            out["step"], out["fresh"] = subject, time.time() - ts < 3600
+        return out
+
+    @staticmethod
+    def _newest_commit():
+        best = None
+        projects = CFG["agent"].get("projects")
+        if not projects:
+            return None
+        root = Path(os.path.expanduser(projects))
+        try:
+            repos = list(root.iterdir())
+        except OSError:
+            return None
+        for repo in repos:
+            if not (repo / ".git").exists() or repo.name.startswith("_"):
+                continue
+            try:
+                out = subprocess.run(
+                    ["git", "-C", str(repo), "for-each-ref", "--sort=-committerdate", "--count=1",
+                     "--format=%(committerdate:unix)%09%(refname:short)%09%(subject)", "refs/heads"],
+                    capture_output=True, text=True, timeout=5).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if not out:
+                continue
+            ts, branch, subject = out.split("\t", 2)
+            if best is None or int(ts) > best[0]:
+                best = (int(ts), repo.name, branch, subject)
+        return best
+
+
+class CommandProvider:
+    """The `command` agent provider: agent.command is run every 2 s (in its own thread, so a slow
+    script never stalls the bar) and prints one JSON line:
+      {"state": "working|waiting|idle|none", "count": n, "task": "...", "step": "...",
+       "progress": [done, total] or null}
+    Anything else, or a script that fails, shows as state "none"."""
+
+    def __init__(self):
+        self.last = {"state": "none", "count": 0, "task": "", "step": "", "progress": None}
+        self.busy = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            cmd = CFG["agent"].get("command")
+            if CFG["agent"].get("provider") == "command" and cmd:
+                try:
+                    out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True,
+                                         timeout=5, env=desktop_env()).stdout.strip().splitlines()
+                    d = json.loads(out[-1]) if out else {}
+                    if not isinstance(d, dict):
+                        raise ValueError("not an object")
+                    st = d.get("state") if d.get("state") in ("working", "waiting", "idle", "none") else "none"
+                    prog = d.get("progress")
+                    prog = prog if isinstance(prog, list) and len(prog) == 2 and all(
+                        isinstance(v, int) for v in prog) and prog[1] > 0 else None
+                    self.last = {"state": st, "count": int(d.get("count") or 0),
+                                 "task": str(d.get("task") or ""), "step": str(d.get("step") or ""),
+                                 "progress": prog}
+                except (OSError, subprocess.SubprocessError, ValueError, TypeError) as e:
+                    _say_once(f"agent command: {e}")
+                    self.last = {"state": "none", "count": 0, "task": "", "step": "", "progress": None}
+            time.sleep(2)
+
+    def sample(self):
+        self.busy = self.last["state"] == "working"
+
+    def status(self):
+        return self.last
+
+
+class Agent:
+    """The agent zone's data: the configured provider, or nothing when the zone is not shown
+    (then no transcript is read and no command runs)."""
+
+    def __init__(self):
+        self._claude, self._command = None, None
+        self.busy = False
+
+    def provider(self):
+        if "agent" not in CFG["zones"] and "progress" not in CFG["zones"]:
+            return None
+        if CFG["agent"].get("provider") == "command":
+            self._command = self._command or CommandProvider()
+            return self._command
+        self._claude = self._claude or ClaudeCode()
+        return self._claude
+
+    def sample(self):
+        p = self.provider()
+        if p:
+            p.sample()
+        self.busy = bool(p and p.busy)
+
+    def status(self):
+        p = self.provider()
+        return p.status() if p else {"state": "none", "count": 0, "task": "", "step": "",
+                                     "progress": None}
+
+
+CLAUDE_PROJECTS = HOME / ".claude" / "projects"
+_task_cache = {}
+
+
+def current_work(cwds):
+    """The task and latest step of the most recently active Claude session, from its transcript.
+
+    Claude Code keeps one jsonl per session under ~/.claude/projects/<cwd with / and . as ->.
+    Returns (task, step, started_unix, updated_unix, TaskProgress) or None."""
+    best = None
+    for cwd in set(cwds):
+        folder = CLAUDE_PROJECTS / re.sub(r"[/.]", "-", cwd)
+        try:
+            path = max(folder.glob("*.jsonl"), key=lambda f: f.stat().st_mtime)
+            mtime = path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if best is None or mtime > best[1]:
+            best = (path, mtime)
+    if best is None:
+        return None
+    path, mtime = best
+    if path not in _task_cache:
+        _task_cache[path] = _first_task(path)
+    task, started = _task_cache[path]
+    return task, _latest_step(path), started, mtime, _progress.read(path), path
+
+
+def _entries(lines):
+    for line in lines:
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+def _plain(text):
+    """A prompt as a one-liner: slash command + args, tags and whitespace folded."""
+    m = re.search(r"<command-name>(.*?)</command-name>.*?<command-args>(.*?)</command-args>", text, re.S)
+    if m:
+        text = f"{m.group(1)} {m.group(2)}"
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())
+
+
+def _first_task(path):
+    try:
+        with path.open(errors="replace") as f:
+            for e in _entries(f):
+                if e.get("type") != "user" or e.get("isSidechain"):
+                    continue
+                content = e.get("message", {}).get("content")
+                if isinstance(content, list):
+                    content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+                if content and content.strip():
+                    ts = e.get("timestamp", "")
+                    try:
+                        started = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+                    except ValueError:
+                        started = path.stat().st_mtime
+                    return _plain(content), started
+    except OSError:
+        pass
+    return "", 0.0
+
+
+ASKS = {"AskUserQuestion", "ExitPlanMode"}
+
+
+def pending_tool(path):
+    """The name of the newest main-thread tool call that has no result yet, or None."""
+    try:
+        with path.open("rb") as f:
+            f.seek(max(0, path.stat().st_size - 256 * 1024))
+            lines = f.read().decode(errors="replace").splitlines()[1:]
+    except OSError:
+        return None
+    for e in reversed(list(_entries(lines))):
+        if e.get("isSidechain") or e.get("type") not in ("user", "assistant"):
+            continue
+        content = e.get("message", {}).get("content")
+        if not isinstance(content, list):
+            return None                         # a plain prompt or reply: nothing pending
+        if e["type"] == "user":
+            if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                return None                     # the newest call already has its result
+            continue
+        uses = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+        if uses:
+            return uses[-1].get("name")
+        if any(isinstance(c, dict) and c.get("type") == "text" for c in content):
+            return None                         # turn ended on text
+    return None
+
+
+def _latest_step(path):
+    """What the session did last: its newest tool call (by description/target) or text."""
+    try:
+        with path.open("rb") as f:
+            f.seek(max(0, path.stat().st_size - 256 * 1024))
+            lines = f.read().decode(errors="replace").splitlines()[1:]
+    except OSError:
+        return ""
+    for e in reversed(list(_entries(lines))):
+        if e.get("type") != "assistant":
+            continue
+        for c in reversed(e.get("message", {}).get("content") or []):
+            if c.get("type") == "tool_use":
+                i = c.get("input") or {}
+                what = (i.get("description") or i.get("file_path") or i.get("pattern")
+                        or i.get("command") or i.get("prompt") or "")
+                if isinstance(what, str) and what.startswith(str(HOME)):
+                    what = "~" + what[len(str(HOME)):]
+                return f"{c.get('name')}: {' '.join(str(what).split())}"
+            if c.get("type") == "text" and c.get("text", "").strip():
+                return " ".join(c["text"].split())
+    return ""
+
+
+class TaskProgress:
+    """The session's own task list, read incrementally from its transcript: TaskCreate/TaskUpdate
+    (ids from the "Task #N" result) or the newest TodoWrite list. Also counts tool calls."""
+
+    def __init__(self):
+        self.path, self.offset = None, 0
+        self.tasks, self.todos, self.steps, self._pending = {}, None, 0, {}
+
+    def read(self, path):
+        if path != self.path:
+            self.__init__()
+            self.path = path
+        try:
+            with path.open("rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except OSError:
+            return self
+        cut = chunk.rfind(b"\n") + 1           # leave a half-written last line for next time
+        self.offset += cut
+        for e in _entries(chunk[:cut].decode(errors="replace").splitlines()):
+            if e.get("isSidechain"):
+                continue
+            for c in e.get("message", {}).get("content") or []:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "tool_use":
+                    self._use(c)
+                elif c.get("type") == "tool_result" and c.get("tool_use_id") in self._pending:
+                    self._result(c)
+        return self
+
+    def _use(self, c):
+        self.steps += 1
+        name, i = c.get("name"), c.get("input") or {}
+        if name == "TodoWrite" and isinstance(i.get("todos"), list):
+            self.todos = [(t.get("activeForm") or t.get("content", ""), t.get("status"))
+                          for t in i["todos"] if isinstance(t, dict)]
+        elif name == "TaskCreate":
+            self._pending[c.get("id")] = i.get("activeForm") or i.get("subject", "")
+        elif name == "TaskUpdate" and str(i.get("taskId", "")) in self.tasks:
+            subject, status = self.tasks[str(i["taskId"])]
+            self.tasks[str(i["taskId"])] = (i.get("activeForm") or subject, i.get("status") or status)
+
+    def _result(self, c):
+        subject = self._pending.pop(c.get("tool_use_id"))
+        text = c.get("content")
+        if isinstance(text, list):
+            text = " ".join(x.get("text", "") for x in text if isinstance(x, dict))
+        m = re.search(r"#(\d+)", str(text or ""))
+        self.tasks[m.group(1) if m else str(len(self.tasks) + 1)] = (subject, "pending")
+
+    def summary(self):
+        """(done, total, active label) from the task list, or None when the session keeps none."""
+        items = self.todos if self.todos is not None else [
+            v for v in self.tasks.values() if v[1] != "deleted"]
+        if not items:
+            return None
+        done = sum(1 for _, st in items if st == "completed")
+        active = next((lbl for lbl, st in items if st == "in_progress"), "")
+        return done, len(items), active
+
+
+_progress = TaskProgress()
+
+class Ambient:
+    """Room loudness from the built-in mic, for the volume dial's hint. Levels only: a 1 s sample
+    every 6 s is reduced to one dBFS figure and smoothed over ~15 s; no audio is kept or written.
+    Off unless dials.room_loudness is true. On 2016-2019 MacBooks the built-in mic needs a patched
+    CS8409 codec driver; with the stock one the mic is silent and no hint shows."""
+
+    def __init__(self):
+        self.db = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        # Short samples, not an open mic: every 6 s record 1.5 s, drop the first 0.5 s (the stream's
+        # start-up click), reduce the last second to one dBFS figure.
+        while True:
+            if not CFG["dials"].get("room_loudness"):
+                self.db = None
+                time.sleep(6)
+                continue
+            try:
+                out = subprocess.run(["timeout", "1.5", "pw-record", "--rate", "8000", "--channels",
+                                      "1", "--format", "s16", "-"], capture_output=True,
+                                     env=desktop_env()).stdout
+                a = array.array("h", out[8000:24000][:len(out[8000:24000]) // 2 * 2])
+                if len(a) > 4000:
+                    m = sum(a) / len(a)
+                    rms = math.sqrt(sum((x - m) ** 2 for x in a) / len(a))
+                    db = 20 * math.log10(max(rms, 0.5) / 32768)
+                    self.db = db if self.db is None else self.db + (db - self.db) * 0.35   # ~15 s
+            except OSError:
+                pass
+            time.sleep(4.5)
+
+    def hint(self):
+        """Suggested volume: quiet room (-60 dBFS) 25%, loud room (-25 dBFS) 85%; None if silent."""
+        if self.db is None or self.db < -85:
+            return None
+        return min(0.85, max(0.25, 0.25 + (self.db + 60) / 35 * 0.60))
+
+
+def orbit(now=None):
+    """The OLED-care drift for this moment: (dx, dy) px, or (0, 0) with oled_care.orbit off."""
+    if not CFG["oled_care"].get("orbit", True):
+        return 0, 0
+    return ORBIT[int((time.time() if now is None else now) // ORBIT_EVERY) % len(ORBIT)]
+
+
+def screen_off():
+    """The laptop panel is blanked (DPMS Off): idle, lock screen dark, or lid closed."""
+    for f in Path("/sys/class/drm").glob("*eDP*/dpms"):
+        try:
+            return f.read_text().strip() == "Off"
+        except OSError:
+            return False
+    return False
+
+
+def session_locked():
+    """True while the compositor holds a session lock (as omarchy-hyprland-session-locked: a LOCK
+    in some monitor's solitaryBlockedBy); None when that cannot be read (callers fail closed)."""
+    try:
+        r = subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, text=True,
+                           timeout=2, env=desktop_env())
+        mons = json.loads(r.stdout) if r.returncode == 0 and r.stdout else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        mons = None
+    if not isinstance(mons, list) or not mons:
+        return None
+    return any("LOCK" in (m.get("solitaryBlockedBy") or []) for m in mons)
+
+
+_act_check = (0.0, False)
+
+
+def may_act():
+    """Whether a touch may run anything: only when the session is known to be unlocked. Asked
+    right before an action fires (at most every 0.25 s), so the 1 s lock poll leaves no gap and a
+    failing hyprctl blocks actions instead of allowing them."""
+    global _act_check
+    if time.time() - _act_check[0] > 0.25:
+        _act_check = (time.time(), session_locked() is False)
+    return _act_check[1]
+
+
+def touch_id_overlay():
+    """The cosmetic Touch ID state, or None. A missing file or dead producer is no overlay."""
+    try:
+        rec = json.loads(TOUCH_ID_STATE.read_text())
+        pid = int(rec["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass                        # the root producer is alive, we just may not signal it
+    except OSError:
+        return None
+    state = rec.get("state")
+    if state not in ("enrollment", "authenticate", "approve", "retry", "success"):
+        return None
+    return state, rec.get("progress")
+
+
+_session_env = (0.0, {})
+
+
+def desktop_env():
+    """The graphical session's environment for anything we launch. The Touch Bar service can start
+    before Hyprland/uwsm export WAYLAND_DISPLAY, XDG_SESSION_TYPE, the full PATH etc. into the user
+    manager, so its own environment lacks them and terminal apps cannot open a window; re-read them
+    from `systemctl --user show-environment` (cached 30 s) and fall back to finding the live
+    Hyprland socket."""
+    global _session_env
+    if time.time() - _session_env[0] > 30:
+        fresh = {}
+        try:
+            out = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True,
+                                 text=True, timeout=3).stdout
+            for line in out.splitlines():
+                k, _, v = line.partition("=")
+                if k and not v.startswith("$'"):
+                    fresh[k] = v
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _session_env = (time.time(), fresh)
+    env = dict(os.environ)
+    env.update(_session_env[1])
+    if "/usr/share/omarchy/bin" not in env.get("PATH", ""):
+        env["PATH"] = env.get("PATH", "/usr/bin") + ":/usr/share/omarchy/bin"
+    hypr = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "hypr"
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig or not (hypr / sig / ".socket.sock").exists():
+        live = sorted((p for p in hypr.glob("*/.socket.sock")), key=lambda p: p.stat().st_mtime)
+        if live:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = live[-1].parent.name
+    return env
+
+CHILDREN = []
+
+
+def run_control(command):
+    """Fire and forget, like a key binding; never let a slow helper stall the bar."""
+    CHILDREN[:] = [c for c in CHILDREN if c.poll() is None]     # reap the finished ones
+    try:
+        CHILDREN.append(subprocess.Popen(command, env=desktop_env(), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True))
+    except OSError as e:
+        log(f"control {command[0]} failed: {e}")
+
+
+def ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+# --- drawing ---------------------------------------------------------------------------------
+class Painter:
+    def __init__(self, width, height):
+        self.w, self.h = width, height
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, width, height)   # = XRGB8888 LE
+        self.cr = cairo.Context(self.surface)
+
+    def text(self, x, y, s, size=17, color=TEXT, font=FONT, weight="Medium", width=None,
+             align="left"):
+        cr = self.cr
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(Pango.FontDescription(f"{font} {weight} {size}px"))
+        layout.set_text(s, -1)
+        if width:
+            layout.set_width(int(width * Pango.SCALE))
+            layout.set_ellipsize(Pango.EllipsizeMode.END)
+            layout.set_alignment({"left": Pango.Alignment.LEFT, "center": Pango.Alignment.CENTER,
+                                  "right": Pango.Alignment.RIGHT}[align])
+        _, logical = layout.get_pixel_extents()
+        cr.set_source_rgb(*color)
+        cr.move_to(x, y - logical.height / 2)
+        PangoCairo.show_layout(cr, layout)
+        return logical.width
+
+    def icon(self, cx, cy, s, size=30, color=TEXT, angle=0.0):
+        """One glyph centred on its ink, not its advance (Nerd Font icons sit off-centre),
+        optionally turned by `angle` radians about that centre."""
+        cr = self.cr
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(Pango.FontDescription(f"{MONO} {size}px"))
+        layout.set_text(s, -1)
+        ink, _ = layout.get_pixel_extents()
+        cr.save()
+        cr.translate(cx, cy)
+        cr.rotate(angle)
+        cr.set_source_rgb(*color)
+        cr.move_to(-ink.x - ink.width / 2, -ink.y - ink.height / 2)
+        PangoCairo.show_layout(cr, layout)
+        cr.restore()
+
+    def label(self, x, y, glyph, color, s):
+        """A small coloured icon then a dim label: the machine zone's headings."""
+        self.icon(x + 6, y, glyph, size=13, color=color)
+        self.text(x + 15, y, s, size=12, color=DIM)
+
+    def plate(self, x, w, color=PLATE, r=8):
+        cr = self.cr
+        h = self.h
+        cr.new_sub_path()
+        cr.arc(x + w - r, r, r, -1.5708, 0)
+        cr.arc(x + w - r, h - r, r, 0, 1.5708)
+        cr.arc(x + r, h - r, r, 1.5708, 3.1416)
+        cr.arc(x + r, r, r, 3.1416, 4.7124)
+        cr.close_path()
+        cr.set_source_rgb(*color)
+        cr.fill()
+
+    def esc_key(self, pressed=False):
+        """Esc as its own kind of key: a red pill (every other key is a grey plate) holding the ISO escape symbol drawn by hand: a circle broken at its
+        upper left, an arrow leaving through the gap."""
+        cr, h, w = self.cr, self.h, ESC_W
+        r, inset = (h - 8) / 2, 4
+        cr.new_sub_path()
+        cr.arc(w - inset - r, h / 2, r, -math.pi / 2, math.pi / 2)
+        cr.arc(inset + r, h / 2, r, math.pi / 2, 3 * math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgb(*((0.80, 0.20, 0.17) if pressed else (0.62, 0.13, 0.11)))   # a red pill
+        cr.fill()
+        cx, cy, rr = w / 2 + 3, h / 2 + 3, 11
+        cr.set_line_width(2.4)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgb(*TEXT)
+        cr.arc(cx, cy, rr, -0.62 * math.pi, 1.12 * math.pi)     # open towards the upper left
+        cr.stroke()
+        tip = (cx - 17, cy - 17)
+        cr.move_to(cx - 2, cy - 2)
+        cr.line_to(*tip)
+        cr.stroke()
+        cr.move_to(tip[0] + 8, tip[1])
+        cr.line_to(*tip)
+        cr.line_to(tip[0], tip[1] + 8)
+        cr.stroke()
+        cr.set_line_cap(cairo.LINE_CAP_BUTT)
+
+    def sign(self, x, w, word, color, t, life, icon=None):
+        """The lock sign: a padlock and `word` in the middle of a black band, each letter
+        decoding out of scrambling katakana (settling DECODE_STEP s after the one before, the
+        padlock first), the way the screen's rain glitched. `t` is the time since it began,
+        `life` how long the lock has lasted: full strength for 30 s, then dimming to a third over
+        10 s (the OLED shows it as long as the machine stays locked)."""
+        k = 1.0 if life < 30 else max(0.35, 1 - 0.65 * (life - 30) / 10)
+        c = tuple(v * k for v in color)
+        adv, size = 26, 28
+        lead = 44                                        # the padlock and its gap
+        x0 = x + (w - lead - adv * len(word)) / 2 + adv          # one letter right of centre
+        mid = self.h / 2
+        if t > 0.05:
+            self.icon(x0 + 14, mid, icon or (ICON_OPEN if word.startswith("UN") else ICON_LOCK), size=24, color=c)
+        for i, ch in enumerate(word):
+            settle = 0.15 + DECODE_STEP * i
+            if t < settle - 0.45:
+                continue                                 # not started yet
+            ch_ = ch if t >= settle else random.choice(KATAKANA)
+            cc = c if t >= settle else tuple(v * 0.7 for v in c)
+            self.text(x0 + lead + adv * i, mid, ch_, size=size, weight="Bold", font=MONO, color=cc,
+                      width=adv, align="center")
+
+    def dot(self, x, y, r, color):
+        self.cr.arc(x, y, r, 0, 6.2832)
+        self.cr.set_source_rgb(*color)
+        self.cr.fill()
+
+    def spark(self, x, y0, w, h, values, color):
+        cr = self.cr
+        n = len(values)
+        cr.move_to(x, y0 + h)
+        for i, v in enumerate(values):
+            cr.line_to(x + w * i / (n - 1), y0 + h - h * min(v, 100) / 100)
+        cr.line_to(x + w, y0 + h)
+        cr.close_path()
+        cr.set_source_rgba(*color, 0.35)
+        cr.fill_preserve()
+        cr.new_path()
+        for i, v in enumerate(values):
+            cr.line_to(x + w * i / (n - 1), y0 + h - h * min(v, 100) / 100)
+        cr.set_source_rgb(*color)
+        cr.set_line_width(1.5)
+        cr.stroke()
+
+    def clear(self):
+        self.cr.set_source_rgb(*BG)
+        self.cr.paint()
+
+
+def slot_rects(width):
+    """The stock 13-slot row: Esc then F1..F12, evenly spread with gaps."""
+    sw = (width - GAP * (SLOTS - 1)) / SLOTS
+    return [(i * (sw + GAP), sw) for i in range(SLOTS)]
+
+
+def local_zone_city():
+    """The city of the local time zone (/etc/localtime -> .../Europe/Rome -> Rome), or ""."""
+    try:
+        target = os.readlink("/etc/localtime")
+    except OSError:
+        return ""
+    return target.rsplit("/", 1)[-1].replace("_", " ") if "zoneinfo" in target else ""
+
+
+def zone_clock(p, x, w, mid, model):
+    """The clock in 7-segment digits, its label (clock.label, default the zone's city) and an
+    optional line about the next full hour (clock.hour_mark, "{m}" = minutes to it)."""
+    c = CFG["clock"]
+    tz = c.get("timezone")
+    if tz:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(tz))
+        label = c.get("label") if c.get("label") is not None else tz.rsplit("/", 1)[-1].replace("_", " ")
+    else:
+        now = datetime.now()
+        label = c.get("label") if c.get("label") is not None else local_zone_city()
+    cw = seven_seg(p, x, mid, now.strftime("%H:%M"), TEXT, h=38, w=21, t=5.5, gap=5)
+    mark = c.get("hour_mark")
+    mark = mark.replace("{m}", str(60 - now.minute)) if isinstance(mark, str) else None
+    if label and mark:
+        p.text(x + cw + 14, mid - 10, label, size=13, color=DIM, width=w - cw - 14)
+        p.text(x + cw + 14, mid + 10, mark, size=13, color=DIM, width=w - cw - 14)
+    elif label or mark:
+        p.text(x + cw + 14, mid, label or mark, size=13, color=DIM, width=w - cw - 14)
+
+
+def since(ts):
+    age = time.time() - ts
+    return "now" if age < 60 else f"{ago(age)} ago"
+
+
+SEGMENTS = {"0": "abcdef", "1": "bc", "2": "abged", "3": "abgcd", "4": "fgbc", "5": "afgcd",
+            "6": "afgedc", "7": "abc", "8": "abcdefg", "9": "abcdfg"}
+
+
+def seven_seg(p, x, cy, text, color, h=36, w=20, t=5.5, gap=7):
+    """Digits as a 7-segment LED readout: lit segments in `color` with a soft glow, unlit ones
+    faintly visible, like a game or calculator display. Returns the width drawn."""
+    cr = p.cr
+    half = h / 2
+    def seg(name, x0):
+        y0 = cy - half
+        horiz = {"a": y0, "g": cy, "d": y0 + h}
+        vert = {"f": (x0, y0, cy), "b": (x0 + w, y0, cy), "e": (x0, cy, y0 + h),
+                "c": (x0 + w, cy, y0 + h)}
+        k = t / 2
+        if name in horiz:                       # hexagon lying flat
+            y = horiz[name]
+            pts = [(x0 + k + 0.7, y), (x0 + k * 2 + 0.7, y - k), (x0 + w - k * 2 - 0.7, y - k),
+                   (x0 + w - k - 0.7, y), (x0 + w - k * 2 - 0.7, y + k), (x0 + k * 2 + 0.7, y + k)]
+        else:                                   # hexagon standing up
+            xx, ya, yb = vert[name]
+            pts = [(xx, ya + k + 0.7), (xx + k, ya + k * 2 + 0.7), (xx + k, yb - k * 2 - 0.7),
+                   (xx, yb - k - 0.7), (xx - k, yb - k * 2 - 0.7), (xx - k, ya + k * 2 + 0.7)]
+        cr.move_to(*pts[0])
+        for pt in pts[1:]:
+            cr.line_to(*pt)
+        cr.close_path()
+    x0 = x + t / 2
+    for ch in text:
+        if ch == ":":                           # two lit dots, half a digit wide
+            for dy in (-h / 4, h / 4):
+                cr.rectangle(x0 - t / 2, cy + dy - t / 2, t, t)
+            cr.set_source_rgb(*color)
+            cr.fill()
+            x0 += t + gap
+            continue
+        lit = SEGMENTS.get(ch, "")
+        for name in "abcdefg":
+            seg(name, x0)
+            if name in lit:
+                cr.set_source_rgba(*color, 0.35)       # glow
+                cr.set_line_width(3)
+                cr.stroke_preserve()
+                cr.set_source_rgb(*color)
+            else:
+                cr.set_source_rgba(*color, 0.10)
+            cr.fill()
+        x0 += w + gap + t
+    return x0 - x - t / 2 - gap
+
+
+def count_square(p, x, cy, n, color, size=40, line=2.5):
+    """A count as one square cut into n cells, up to 25 (a 5 x 5 grid): 1-3 side by side, then
+    round(sqrt(n)) rows with the extra cells in the bottom rows (5 = 2 over 3, 7 = 2 / 2 / 3). 0 is an empty outline; over 25
+    falls back to 7-segment digits. Returns the width drawn."""
+    if n > 25:
+        return seven_seg(p, x, cy, str(n), color)
+    cr, y0 = p.cr, cy - size / 2
+    if n <= 0:
+        cr.rectangle(x + 1, y0 + 1, size - 2, size - 2)
+        cr.set_source_rgba(*color, 0.5)
+        cr.set_line_width(2)
+        cr.stroke()
+        return size
+    rows = 1 if n <= 3 else round(math.sqrt(n))
+    base, extra = divmod(n, rows)
+    rh = (size + line) / rows
+    for r in range(rows):
+        cells = base + (1 if r >= rows - extra else 0)
+        cw = (size + line) / cells
+        for c in range(cells):
+            cr.rectangle(x + c * cw, y0 + r * rh, cw - line, rh - line)
+    cr.set_source_rgb(*color)
+    cr.fill()
+    return size
+
+
+def zone_agent(p, x, w, mid, model):
+    """The agent provider's state as a square count (one cell per session), coloured by state
+    (green working, blue waiting for you, amber idle, grey none), then its task and latest step."""
+    a = model["agent_status"]
+    model.setdefault("touch", []).append((x, w, ("agent",), "agent"))
+    state, n = a.get("state"), a.get("count") or 0
+    state_color = {"waiting": BLUE, "working": GREEN, "idle": AMBER}.get(state, DIM)
+    if state == "working" and int(time.time() * 2) % 2:      # the square pulses while working
+        state_color = tuple(c * 0.7 for c in state_color)
+    lw = count_square(p, x + 4, mid, n, state_color)
+    cx, end = x + 4 + lw + 22, x + w
+    if a.get("task") and end - cx > 60:
+        line = BLUE if state == "waiting" else GREEN if state == "working" or a.get("fresh") else DIM
+        p.text(cx, mid - 11, a["task"], size=13, color=line, width=end - cx)
+        if a.get("step"):
+            p.text(cx, mid + 10, a["step"], size=16, width=end - cx)
+
+
+BATTERY_GLYPHS = ["\U000f008e", "\U000f007a", "\U000f007b", "\U000f007c", "\U000f007d",
+                  "\U000f007e", "\U000f007f", "\U000f0080", "\U000f0081", "\U000f0082",
+                  "\U000f0079"]                     # outline, 10 .. 90, full
+
+
+WIFI_GLYPHS = ["\U000f091f", "\U000f0922", "\U000f0925", "\U000f0928"]   # 1 .. 4 bars
+
+
+def charge_color(cap, limit):
+    """Red when empty, yellow at 50%, green at the charge hold."""
+    def mix(a, b, t):
+        return tuple(x + (y - x) * min(1.0, max(0.0, t)) for x, y in zip(a, b))
+    if cap <= 50:
+        return mix(RED, VOLT, cap / 50)
+    return mix(VOLT, GREEN, (cap - 50) / max(1, limit - 50))
+
+
+def heat(value, cool, warm, hot, base):
+    """An icon colour that warms with the value: `base` up to `cool`, then toward amber at `warm`
+    and red at `hot`."""
+    def mix(a, b, t):
+        return tuple(x + (y - x) * min(1.0, max(0.0, t)) for x, y in zip(a, b))
+    if value <= warm:
+        return mix(base, AMBER, (value - cool) / (warm - cool))
+    return mix(AMBER, RED, (value - warm) / (hot - warm))
+
+
+def zone_machine(p, x, w, mid, model):
+    """CPU sparkline, temperature + fan, RAM, Wi-Fi, battery and power slots (charge %, watts, AC or battery)."""
+    m = model["machine"]
+    cpu = m.cpu[-1]
+    # Every slot's tap and hold come from config "slots" (see run_action)
+    touch = model.setdefault("touch", [])
+    touch.append((x, 104, ("slot", "graph"), "graph"))
+    touch.append((x + 104, 71, ("slot", "cpu"), "cpu"))
+    touch.append((x + 175, 72, ("slot", "thermal"), "thermal"))
+    touch.append((x + 247, 70 - 8, ("slot", "memory"), "memory"))
+    p.spark(x, 10, 100, p.h - 20, list(m.cpu),
+            RED if cpu > 85 else AMBER if cpu > 60 else GREEN)
+    p.label(x + 110, mid - 11, "\U000f061a", AMBER if model.get("boost") else heat(cpu, 30, 65, 90, MINT),
+            slot_flash(model, "cpu") or ("boost" if model.get("boost") else "CPU"))
+    p.text(x + 110, mid + 10, f"{cpu:.0f}%", size=17, font=MONO)
+    x += 175
+    # Temperature and fans in one slot: the fan icon turns with the fans' speed and takes the
+    # temperature's colour (cyan -> amber -> red); heading = fan %, value = CPU temperature.
+    t, fan = m.temp(), m.fan_pct
+    model["fan_icon"] = (x + 6, mid - 11)
+    model["fan_color"] = heat(t, 50, 72, 90, ICE) if t is not None else ICE
+    draw_anim(p, model)
+    p.text(x + 15, mid - 11, slot_flash(model, "thermal") or ("fan max" if model.get("fan_boost") else
+           f"fan {fan:.0f}%" if fan is not None else "temp"), size=12, color=DIM)
+    if t is not None:
+        p.text(x, mid + 10, f"{t:.0f}°", size=17, font=MONO,
+               color=RED if t > 85 else AMBER if t > 70 else TEXT)
+    x += 72
+    ram = m.mem()
+    p.label(x, mid - 11, "\U000f035b", heat(ram, 50, 75, 92, VIOLET), slot_flash(model, "memory") or "RAM")
+    p.text(x, mid + 10, f"{ram:.0f}%", size=17, font=MONO)
+    x += 70
+    sig = m.wifi()
+    model.setdefault("touch", []).append((x - 8, 70, ("slot", "wifi"), "wifi"))
+    if sig is None:
+        p.label(x, mid - 11, "\U000f05aa", DIM, slot_flash(model, "wifi") or "wifi")
+        p.text(x, mid + 10, "off", size=17, font=MONO, color=DIM)
+    else:
+        bars = WIFI_GLYPHS[min(3, sig // 25)]
+        p.label(x, mid - 11, bars, charge_color(sig, 100), slot_flash(model, "wifi") or "wifi")
+        p.text(x, mid + 10, f"{sig}%", size=17, font=MONO)
+    x += 70
+    cap, status = m.battery()
+    flash = model.get("slot_flash")
+    flash = flash if flash and time.time() < flash[2] else None
+    if cap is not None:
+        # Battery: the icon empties with the charge and goes red -> yellow -> green toward the
+        # charge hold; it breathes while charging. Tap: battery view. Hold: limit 80 <-> 100.
+        model["battery_icon"] = (x + 6, mid - 11)
+        model["battery_color"] = charge_color(cap, m.charge_limit())
+        model["battery_glyph"] = BATTERY_GLYPHS[min(10, max(0, round(cap / 10)))]
+        draw_anim(p, model)
+        model["touch"].append((x - 8, 70, ("slot", "battery"), "battery"))
+        label = flash[1] if flash and flash[0] == "battery" else f"max {m.charge_limit()}" \
+            if m.charge_limit() < 100 else "bat"
+        p.text(x + 15, mid - 11, label, size=12, color=TEXT if flash and flash[0] == "battery" else DIM)
+        p.text(x, mid + 10, f"{cap}%", size=17, font=MONO,
+               color=RED if cap < 15 and not m.on_ac() else TEXT)
+    x += 70
+    # Power: what the machine draws: the SMC's whole-system watts when a reader publishes them,
+    # else the battery's discharge on battery, else the CPU package (RAPL) when readable.
+    # An amber cup while the lid mode is "awake".
+    watts, scope = m.system_watts()
+    ac = m.on_ac()                                      # plug in green on AC, unplugged plug in amber
+    p.label(x, mid - 11, "\U000f06a5" if ac else "\U000f06a6",
+            GREEN if ac else AMBER, flash[1] if flash and flash[0] == "power" else scope)
+    p.text(x, mid + 10, f"{watts:.0f}W" if watts is not None else "AC", size=17, font=MONO)
+    if lid_mode() == "awake":                           # lid close keeps it working
+        p.icon(x + 62, mid + 10, "\U000f0176", size=12, color=AMBER)
+    model["touch"].append((x - 8, 70, ("slot", "power"), "power"))
+
+
+
+def launch_tui(app, cmd):
+    """A terminal window with class `app` running `cmd`: through Omarchy's launch-or-focus
+    (helpers.launch_tui) when it is there, else helpers.terminal / $TERMINAL / foot, started
+    with --app-id (foot's flag)."""
+    tui = helper("launch_tui")
+    if tui:
+        return [tui, f"--app-id={app}"] + cmd
+    term = CFG["helpers"].get("terminal") or desktop_env().get("TERMINAL") or "foot"
+    return [term, f"--app-id={app}"] + cmd
+
+
+def hwdeck_view(view):
+    """hwdeck's focused full-screen view in a terminal (focused if that view is already open)."""
+    return launch_tui(app_id(f"hwdeck-{view}"), [helper("hwdeck") or "hwdeck", "--view", view])
+
+
+def set_level(machine, key, frac, off=False):
+    """Set the screen or keyboard backlight (brightnessctl, via logind) or the output volume
+    (wpctl) to an exact level, and show it at once on the dial."""
+    n = round(min(1.0, max(0.0, frac)) * 100)
+    if key == "vol":
+        run_control(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{n}%"])
+    else:
+        pattern = "sys/class/backlight/*" if key == "screen" else "sys/class/leds/*kbd_backlight*"
+        dev = next(Path("/").glob(pattern), None)
+        if dev is None:
+            return
+        run_control(["brightnessctl", "-q", "-d", dev.name, "set", f"{n if off or key != 'screen' else max(n, 1)}%"])
+    machine.levels[key] = n / 100
+
+
+def dial_level(action, x):
+    """Finger position on a dial -> 0..1, with a little dead space at each edge."""
+    _, _, dx, dw = action
+    return (x - dx - 12) / (dw - 24)
+
+
+def close_window(app_id):
+    """Close the window with this class if one is open; True when it was. Lets a tap toggle."""
+    env = desktop_env()
+    try:
+        clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True,
+                                            text=True, timeout=2, env=env).stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    found = [c["address"] for c in clients if c.get("class") == app_id and c.get("address")]
+    for addr in found:                          # by address, as Omarchy's close-all does
+        subprocess.run(["hyprctl", "dispatch", f'hl.dsp.window.close({{ window = "address:{addr}" }})'],
+                       capture_output=True, timeout=2, env=env)
+    return bool(found)
+
+
+def slot_flash(model, slot):
+    """A short message on a slot's heading after a hold, for 3 s."""
+    f = model.get("slot_flash")
+    return f[1] if f and f[0] == slot and time.time() < f[2] else None
+
+
+def set_profile(name):
+    run_control(["powerprofilesctl", "set", name])
+
+
+WALL = ["cpu", "thermal", "network", "memory", "power", "battery"]
+
+
+def toggle_wall():
+    """The whole hwdeck wall: open every view that is missing, or close all when all are up."""
+    try:
+        open_now = {c.get("class") for c in json.loads(subprocess.run(
+            ["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2,
+            env=desktop_env()).stdout or "[]")}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return
+    missing = [v for v in WALL if app_id(f"hwdeck-{v}") not in open_now]
+    if not missing:
+        for v in WALL:
+            close_window(app_id(f"hwdeck-{v}"))
+        return
+    for v in missing:
+        run_control(hwdeck_view(v))
+
+
+def toggle_view(view):
+    """Tap opens an hwdeck view, tap again closes it."""
+    if not close_window(app_id(f"hwdeck-{view}")):
+        run_control(hwdeck_view(view))
+
+
+def open_agent():
+    """The agent zone's tap (agent.open): "tmux-attach" shows the running Claude session (a
+    terminal attached to the tmux session whose pane runs it, or a new `claude` in
+    agent.projects); "sh:<command>" runs that; null does nothing. Tapping again closes the
+    terminal (detaching; the session keeps running in tmux)."""
+    how = CFG["agent"].get("open")
+    if not how or how == "none":
+        return
+    if isinstance(how, str) and how.startswith("sh:"):
+        return run_control(["sh", "-c", how[3:]])
+    if how != "tmux-attach":
+        _say_once(f"agent.open {how!r} is not tmux-attach, sh:<command> or null")
+        return
+    app = app_id("claude")
+    if close_window(app):
+        return
+    claude = set()
+    for p in Path("/proc").iterdir():
+        try:
+            cmd = (p / "cmdline").read_bytes().split(b"\0")
+            if p.name.isdigit() and cmd[0].endswith(b"/claude") and b"remote-control" not in cmd:
+                claude.add(p.name)
+                claude.add((p / "stat").read_text().rsplit(")", 1)[1].split()[1])   # its parent
+        except (OSError, IndexError):
+            continue
+    try:
+        panes = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_pid}"],
+                               capture_output=True, text=True, timeout=3).stdout.split("\n")
+    except (OSError, subprocess.SubprocessError):
+        panes = []
+    for line in panes:
+        name, _, pid = line.rpartition(" ")
+        if pid in claude:
+            return run_control(launch_tui(app, ["tmux", "attach", "-t", name]))
+    where = os.path.expanduser(CFG["agent"].get("projects") or "~")
+    run_control(launch_tui(app, ["bash", "-lc", f"cd {shlex.quote(where)} && exec claude"]))
+
+
+CHARGE_KNOB = Path("/sys/devices/platform/applesmc.768/charge_control_end_threshold")
+CHARGE_HOLD = 80
+BOOST_HOT = 90          # °C: CPU boost switches itself off here
+FAN_GOOD = 60           # °C: after the first minute, max fans run until the CPU is back to this
+FAN_CAP = 15 * 60       # s: max fans hand back to the SMC after this whatever the temperature
+
+
+def needs_setup(action):
+    """The flash for an action whose helper is missing, with one journal line naming the
+    omarchy-mac-kit module that installs it."""
+    module = NEEDS.get(action, (None, "?"))[1]
+    _say_once(f"{action}: its helper is not installed ({module})")
+    return "needs setup"
+
+
+def root_hw(cmd):
+    """Run the root helper (helpers.hw) through its narrow sudo rule: True when it ran, False
+    when sudo refused, None when the helper is not installed. t1bridge's t1-touchbar.service
+    sets NoNewPrivileges=yes, so sudo cannot elevate from inside it; a transient unit from the
+    user manager (systemd-run --user) runs outside that limit."""
+    hw = helper("hw")
+    if not hw:
+        return None
+    try:
+        return subprocess.run(["systemd-run", "--user", "--wait", "--quiet", "--collect",
+                               "sudo", "-n", hw, cmd], capture_output=True, timeout=15,
+                              env=desktop_env()).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def do_lock():
+    cmd = helper("lock_cmd")
+    run_control([cmd] if cmd else ["loginctl", "lock-session"])
+
+
+def run_action(model, action, now, slot=None):
+    """Run one configured action; returns the message to flash on the slot's heading, or ""."""
+    if action is None:
+        return ""
+    problem = action_problem(action)
+    if problem:
+        _say_once(f"slot {slot}: action {action!r}: {problem}")
+        return "bad action"
+    if action.startswith("sh:"):
+        run_control(["sh", "-c", action[3:]])
+        return ""
+    if action.startswith("hwdeck:"):
+        toggle_view(action[7:])
+        return ""
+    if action == "wall":
+        toggle_wall()
+    elif action == "agent-open":
+        open_agent()
+    elif action == "lock":
+        do_lock()
+    elif action == "lock-rain":                 # a short screen rain pass, then lock
+        rain = helper("rainpass")
+        if rain:
+            run_control([rain, "--force", "--lock"])
+        else:
+            needs_setup(action)
+            do_lock()
+    elif action == "cpu-boost":                 # performance profile until hot or held again
+        model["boost"] = not model.get("boost")
+        set_profile("performance" if model["boost"] else "balanced")
+        return "boost on" if model["boost"] else "boost off"
+    elif action == "fans-max":                  # max fans for a minute, then until it cools
+        if model.get("fan_boost"):
+            model["fan_boost"] = None
+            ok = root_hw("fan-auto")
+            return needs_setup(action) if ok is None else "fan auto" if ok else "no root"
+        ok = root_hw("fan-max")
+        if not ok:
+            return needs_setup(action) if ok is None else "no root"
+        model["fan_boost"] = (now + 60, now + FAN_CAP)
+        return "fan max"
+    elif action == "mem-trim":
+        ok = root_hw("mem-trim")
+        return needs_setup(action) if ok is None else "trimmed" if ok else "no root"
+    elif action == "wifi-toggle":               # NetworkManager allows this from the session
+        run_control(["sh", "-c", "nmcli radio wifi off; sleep 2; nmcli radio wifi on"])
+        return "restart"
+    elif action == "charge-limit":
+        return toggle_charge_limit()
+    elif action == "lid-mode":
+        return f"lid: {toggle_lid_mode()}"
+    return ""
+
+
+def toggle_lid_mode():
+    """Flip what closing the lid does: sleep (lock + power-saver) or awake (keeps working).
+    helpers.lid (omk-lid) owns the mode file and the Hyprland lid bindings call it."""
+    lid = helper("lid")
+    if not lid:
+        return needs_setup("lid-mode")
+    try:
+        return subprocess.run([lid, "toggle"], capture_output=True,
+                              text=True, timeout=3, env=desktop_env()).stdout.strip() or "?"
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"lid mode: {e}")
+        return "needs setup"
+
+
+def lid_mode():
+    try:
+        return helper_file("lid_state").read_text().strip() or "sleep"
+    except (OSError, AttributeError):
+        return "sleep"
+
+
+def toggle_charge_limit():
+    """Flip the charge limit between the 80% hold and 100%; returns the flash label. The knob
+    is the patched applesmc's, made writable for you by the battery-limit module."""
+    try:
+        new = 100 if int(CHARGE_KNOB.read_text()) < 100 else CHARGE_HOLD
+        CHARGE_KNOB.write_text(f"{new}\n")
+    except (OSError, ValueError) as e:
+        log(f"charge limit: {e}")
+        return needs_setup("charge-limit")
+    state = helper_file("charge_state")
+    try:
+        if state:
+            state.write_text(f"{new}\n")
+    except OSError as e:
+        log(f"charge limit not kept across reboots: {e}")
+    log(f"charge limit set to {new}%")
+    return f"max {new}%"
+
+
+def draw_anim(p, model):
+    """The animated icons: the fan turned to its angle, and the plug pulsing while charging.
+    Animation frames redraw only these over a cached frame (see run)."""
+    if model.get("defer_anim"):
+        return
+    if model.get("fan_icon"):
+        cx, cy = model["fan_icon"]
+        p.icon(cx, cy, "\U000f0210", size=13, color=model.get("fan_color", ICE),
+               angle=model.get("fan_angle", 0.0))
+    if model.get("battery_icon"):
+        cx, cy = model["battery_icon"]
+        glyph = model["battery_glyph"]
+        color, size = model["battery_color"], 13
+        if model["machine"].charging:                # a breathing glow, 1 s per breath
+            t = 0.5 + 0.5 * math.sin(time.time() * 2 * math.pi)
+            color, size = tuple(c * (0.45 + 0.55 * t) for c in color), 13 + t
+        p.icon(cx, cy, glyph, size=size, color=color)
+
+
+def zone_progress(p, x, w, mid, model):
+    """The agent's task list (provider "progress": [done, total]): a done/total bar and the
+    active item. Shown with agent.progress = true, or "progress" in zones."""
+    a = model["agent_status"]
+    if a.get("state", "none") == "none" or not a.get("count"):
+        p.text(x, mid, "no task running", size=15, color=DIM)
+        return
+    prog = a.get("progress")
+    if not prog:
+        p.text(x, mid - 11, "no task list", size=13, color=DIM)
+        if a.get("steps") is not None:
+            p.text(x, mid + 10, f"{a['steps']} steps · {ago(time.time() - a.get('started', time.time()))}",
+                   size=16, font=MONO, width=w)
+        return
+    done, total = prog
+    active = a.get("active", "")
+    head = f"{done}/{total}"
+    tw = p.text(x, mid - 11, head, size=13, weight="Bold", font=MONO,
+                color=GREEN if done == total else TEXT)
+    p.text(x + tw + 10, mid - 11, active or ("all done" if done == total else ""), size=13,
+           color=DIM, width=w - tw - 10)
+    by, bh = mid + 6, 10
+    cr = p.cr
+    cr.rectangle(x, by, w, bh)
+    cr.set_source_rgb(*PLATE)
+    cr.fill()
+    cr.rectangle(x, by, w * done / total, bh)
+    cr.set_source_rgb(*GREEN)
+    cr.fill()
+    if active and done < total:                 # the item being worked on, pulsing
+        cr.rectangle(x + w * done / total, by, w / total, bh)
+        cr.set_source_rgba(*AMBER, 0.9 if int(time.time() * 2) % 2 else 0.5)
+        cr.fill()
+
+
+ZONE_DRAW = {"clock": zone_clock, "agent": zone_agent, "progress": zone_progress,
+             "machine": zone_machine}
+ZONE_WIDTH = {"clock": 228, "agent": None, "progress": 270, "machine": 532}   # None = flexible
+
+
+def active_zones():
+    """The configured zones, with the progress zone after the agent's when agent.progress."""
+    zones = list(CFG["zones"])
+    if CFG["agent"].get("progress") and "agent" in zones and "progress" not in zones:
+        zones.insert(zones.index("agent") + 1, "progress")
+    return zones
+
+
+def controls_w():
+    return 3 * DIAL_W + 3 * DIAL_GAP + (MUTE_W if CFG["lock"].get("key", True) else 0)
+
+
+def render(p, model, pressed):
+    """Draw one frame; returns the list of (x, w, action) touch targets. While the unlock plays,
+    the sign decodes into a green UNLOCKED; then the strip."""
+    now, t0 = time.time(), model.get("unlock_t0")
+    rt = model.get("refresh_t0")
+    model["fan_icon"] = model["battery_icon"] = None   # a sign covers the bar: no animated icons on it
+    matrix = CFG["lock"].get("screen_sign") == "matrix"
+    if rt and now - rt < REFRESH_S and not model.get("locked") and CFG.get("refresh_sign"):
+        # the screen's rain pass just ended (its red column left the screen): the same kind of
+        # sign as LOCKED: red PROCESSING decoding, then a green REFRESHED
+        p.cr.identity_matrix()
+        p.clear()
+        p.cr.translate(*orbit(now))
+        kx = p.w - MUTE_W
+        if now - rt < REFRESH_PROC:
+            p.sign(0, kx - GAP, "PROCESSING", RED, now - rt, 0, icon=ICON_REFRESH)
+        else:
+            p.sign(0, kx - GAP, "REFRESHED", GREEN, now - rt - REFRESH_PROC, 0, icon=ICON_REFRESH)
+        p.plate(kx, MUTE_W, PLATE_DIAL, r=12)
+        p.icon(kx + MUTE_W / 2, p.h / 2, ICON_LOCK, size=26, color=LOCKY)
+        return []
+    if not t0 or now >= model.get("lock_ok_until", 0) or not matrix:
+        model.pop("unlock_t0", None)
+        return render_frame(p, model, pressed)
+    p.cr.identity_matrix()
+    p.clear()
+    p.cr.translate(*orbit(now))
+    kx = p.w - MUTE_W
+    p.sign(0, kx - GAP, "UNLOCKED", GREEN, now - t0, 0)
+    p.plate(kx, MUTE_W, GREEN, r=12)                    # the key stays green to the end
+    p.icon(kx + MUTE_W / 2, p.h / 2, ICON_FINGER, size=26, color=BG)
+    return []
+
+
+def render_frame(p, model, pressed):
+    """Draw one frame; returns the list of (x, w, action) touch targets."""
+    model["fan_icon"] = model["battery_icon"] = None
+    model["touch"] = []                         # zones add (x, w, action, name) tap areas
+    p.cr.identity_matrix()
+    p.clear()
+    if model.get("dark") and not model.get("touch_id"):   # main screen off: keep the OLED dark
+        return []
+    # OLED burn-in: the whole picture drifts a pixel or two every ORBIT_EVERY seconds; touch
+    # targets stay where they are (a 2 px offset is far below a finger)
+    p.cr.translate(*orbit())
+    w, mid = p.w, p.h / 2
+    targets = []
+    overlay = model.get("touch_id")
+
+    if model.get("locked"):
+        # The lock screen: a black bar with LOCKED in red in the middle, decoding out of red
+        # katakana as the screen's red column did, and the key at the right end next to the
+        # sensor: an amber key with a black fingerprint; red on a miss, a green key once recognised. No Esc and no text: nothing to back out
+        # of here, and typing the password still works.
+        state, now = (overlay or ("authenticate", None))[0], time.time()
+        kx = w - MUTE_W
+        if model.get("lock_view") is None:
+            model["lock_view"] = True
+            model["lock_since"] = now
+        model["lock_step"] = now
+        if CFG["lock"].get("screen_sign") == "matrix":      # "off": the key alone
+            p.sign(0, kx - GAP, "LOCKED", RED, now - model["lock_since"], now - model["lock_since"])
+        if state == "retry":
+            icon, color = ICON_FINGER, RED
+        elif state == "success":
+            icon, color = ICON_FINGER, GREEN
+            if not model.get("unlock_t0") and CFG["lock"].get("screen_sign") == "matrix":   # the unlock plays
+                model["unlock_t0"], model["lock_ok_until"] = now, now + UNLOCK_S
+        else:
+            icon, color = ICON_FINGER, LOCKY                # the amber fingerprint key, no arrow
+        if color == GREEN:                              # recognised: green key, black icon
+            p.plate(kx, MUTE_W, GREEN, r=12)
+            p.icon(kx + MUTE_W / 2, mid, icon, size=26, color=BG)
+        elif color == LOCKY:                            # amber key, black icon
+            p.plate(kx, MUTE_W, LOCKY, r=12)
+            p.icon(kx + MUTE_W / 2, mid, icon, size=26, color=BG)
+        else:
+            p.plate(kx, MUTE_W, PLATE_DIAL, r=12)
+            p.icon(kx + MUTE_W / 2, mid, icon, size=26, color=color)
+        return targets
+
+    model["lock_view"] = None                   # a fresh sign and fingerprint for the next lock
+    if model.get("fn"):
+        for i, (x, sw) in enumerate(slot_rects(w)):
+            name = "esc" if i == 0 else f"F{i}"
+            p.plate(x, sw, PRESSED if name in pressed else PLATE)
+            p.text(x, mid, name, width=sw, align="center")
+            targets.append((x, sw, ("key", KEY_ESC if i == 0 else KEY_F[i - 1]), name))
+        return targets
+
+    # Esc
+    p.esc_key("esc" in pressed)
+    targets.append((0, ESC_W, ("key", KEY_ESC), "esc"))
+    controls_x = w - controls_w()
+
+    # Status zones in the configured order, between Esc and the controls. Fixed zones keep their
+    # width; the agent takes what is left.
+    zones = active_zones()
+    x, end = ESC_W + 24, controls_x - 16
+    fixed = sum(ZONE_WIDTH[z] for z in zones if ZONE_WIDTH[z]) + 24 * (len(zones) - 1)
+    flex = max(260, end - x - fixed)
+    for i, zone in enumerate(zones):
+        zw = ZONE_WIDTH[zone] or flex
+        if x + zw > end:
+            break                                   # never draw over the controls
+        ZONE_DRAW[zone](p, x, zw, mid, model)
+        x += zw
+        if i < len(zones) - 1:
+            x = divider(p, x)
+
+    targets.extend(model["touch"])
+
+    # Controls: screen brightness, keyboard backlight, volume as ring dials, then mute
+    levels, x, active = model["machine"].levels, controls_x, model.get("active_dial")
+    cr = p.cr
+    for key, icon, color in DIALS:
+        on = key == active
+        p.plate(x, DIAL_W, PLATE if on else PLATE_DIAL, r=12)     # white and greys only
+        cx, level = x + DIAL_W / 2, levels.get(key)
+        hint = model["machine"].hints.get(key) if key != "vol" else \
+            (model["ambient"].hint() if model.get("ambient") else None)
+        # Smooth ring in the clock's white on dark grey: arc, knob, icon and glow; no colour
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_width(5)
+        muted = key == "vol" and levels.get("muted")
+        off = muted or (level is not None and level <= 0.005)
+        cr.arc(cx, mid, 22, 0.75 * math.pi, 2.25 * math.pi)
+        cr.set_source_rgba(*(RED if off else TEXT), 0.45 if off else 0.14)
+        cr.stroke()
+        # Where a gesture left it, in whites only: red off / muted, strong white at max, plain
+        # white at the suggestion; anywhere else the soft/full white arcs below
+        state = None if off or level is None else STRONG if level >= 0.995 else \
+            TEXT if hint is not None and abs(level - hint) < 0.02 else None
+        if muted:
+            pass
+        elif state and level is not None:
+            end = 0.75 * math.pi + 1.5 * math.pi * level
+            if on:
+                cr.set_line_width(11)
+                cr.arc(cx, mid, 22, 0.75 * math.pi, end)
+                cr.set_source_rgba(*state, 0.3)
+                cr.stroke()
+                cr.set_line_width(5)
+            if state == STRONG:                         # a soft halo marks max
+                cr.set_line_width(9)
+                cr.arc(cx, mid, 22, 0.75 * math.pi, end)
+                cr.set_source_rgba(*STRONG, 0.18)
+                cr.stroke()
+                cr.set_line_width(5)
+            cr.arc(cx, mid, 22, 0.75 * math.pi, end)
+            cr.set_source_rgb(*state)
+            cr.stroke()
+            cr.arc(cx + 22 * math.cos(end), mid + 22 * math.sin(end), 4.5 if on else 3.5, 0, 2 * math.pi)
+            cr.fill()
+        elif level is not None:
+            end = 0.75 * math.pi + 1.5 * math.pi * level
+            if on:                                      # glow while touched
+                cr.set_line_width(11)
+                cr.arc(cx, mid, 22, 0.75 * math.pi, end)
+                cr.set_source_rgba(*TEXT, 0.25)
+                cr.stroke()
+                cr.set_line_width(5)
+            if level > 0:
+                # Up to the hint the arc is a softer white; past it, full white: how far above
+                # the suggested level you are. With no hint, all full white.
+                split = end if hint is None else min(end, 0.75 * math.pi + 1.5 * math.pi * hint)
+                cr.arc(cx, mid, 22, 0.75 * math.pi, split)
+                cr.set_source_rgb(*(SOFT if hint is not None else TEXT))
+                cr.stroke()
+                if split < end:
+                    cr.arc(cx, mid, 22, split, end)
+                    cr.set_source_rgb(1, 1, 1)
+                    cr.stroke()
+            cr.arc(cx + 22 * math.cos(end), mid + 22 * math.sin(end), 4.5 if on else 3.5, 0, 2 * math.pi)
+            cr.set_source_rgb(*TEXT)
+            cr.fill()
+        if hint is not None and not off:                # what the room's light suggests: a quiet dot
+            a = 0.75 * math.pi + 1.5 * math.pi * hint
+            hx, hy = cx + 22 * math.cos(a), mid + 22 * math.sin(a)
+            cr.arc(hx, hy, 4.2, 0, 2 * math.pi)        # a black ring, so it shows even on the knob
+            cr.set_source_rgb(*BG)
+            cr.fill()
+            cr.arc(hx, hy, 2.8, 0, 2 * math.pi)
+            cr.set_source_rgb(*HINT_DOT)
+            cr.fill()
+        cr.set_line_cap(cairo.LINE_CAP_BUTT)
+        if on and level is not None:                    # the number while touched
+            p.text(cx - 30, mid, f"{round(level * 100)}", size=16, weight="Bold", font=MONO,
+                   width=60, align="center")
+        else:
+            p.icon(cx, mid, "\U000f0581" if muted else icon, size=20, color=RED if off else TEXT)
+        targets.append((x, DIAL_W, ("dial", key, x, DIAL_W), key))
+        x += DIAL_W + DIAL_GAP
+    # lock while open; a fingerprint while a Touch ID request runs (sudo, an approval): an amber
+    # key with a black fingerprint; red on a miss, green on success. lock.key = false: no key.
+    if not CFG["lock"].get("key", True):
+        return targets
+    tid = model.get("touch_id")
+    locked = model.get("locked") or tid
+    state = tid[0] if tid else ""
+    if locked and state == "success":                   # green key, black fingerprint
+        p.plate(x, MUTE_W, GREEN, r=12)
+        p.icon(x + MUTE_W / 2, mid, ICON_FINGER, size=26, color=BG)
+    elif locked and state == "retry":
+        p.plate(x, MUTE_W, PLATE_DIAL, r=12)
+        p.icon(x + MUTE_W / 2, mid, ICON_FINGER, size=26, color=RED)
+    elif locked:
+        if int((time.time() - model.get("tid_since", 0)) / SUDO_BLINK) == 1:    # the one blink
+            p.plate(x, MUTE_W, PLATE_DIAL, r=12)
+        else:
+            p.plate(x, MUTE_W, LOCKY, r=12)
+            p.icon(x + MUTE_W / 2, mid, ICON_FINGER, size=26, color=BG)
+    else:
+        p.plate(x, MUTE_W, (1.0, 0.88, 0.50) if "lock" in pressed else LOCKY, r=12)   # amber key, black lock
+        p.icon(x + MUTE_W / 2, mid, ICON_LOCK, size=26, color=BG)
+    targets.append((x, MUTE_W, ("finger",) if locked else ("slot", "lock"), "lock"))
+    return targets
+
+
+def divider(p, x):
+    p.cr.rectangle(x, 14, 1, p.h - 28)
+    p.cr.set_source_rgb(0.25, 0.25, 0.27)
+    p.cr.fill()
+    return x + 24
+
+
+# --- hardware session ------------------------------------------------------------------------
+class Bar:
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.connect(SOCKET_PATH)
+        self.next_id = 1
+        self.frame_id = 0
+        self.busy = False
+
+    def send(self, mtype, payload=b"", fds=None):
+        rid = self.next_id
+        self.next_id = self.next_id % 0xFFFFFFFF + 1
+        packet = HEADER.pack(MAGIC, MAJOR, mtype, len(payload), rid) + payload
+        if fds:
+            self.sock.sendmsg([packet], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                          array.array("i", fds))])
+        else:
+            self.sock.send(packet)
+        return rid
+
+    def recv(self):
+        data = self.sock.recv(65536)
+        if not data:
+            raise ConnectionError("service closed the connection")
+        magic, major, mtype, length, rid = HEADER.unpack_from(data)
+        if magic != MAGIC or major != MAJOR or len(data) != HEADER.size + length:
+            raise ConnectionError("malformed packet")
+        return mtype, rid, data[HEADER.size:]
+
+    def handshake(self):
+        self.send(HELLO, struct.pack("<HHQ", MINOR, 0, FEATURES))
+        mtype, _, payload = self.recv()
+        if mtype != HELLO_ACK:
+            raise ConnectionError(f"hello refused: type {mtype:#x} {payload.hex()}")
+        _, _, w, h, fmt, _ = struct.unpack("<HHIIII", payload)
+        if fmt != 1:
+            raise ConnectionError(f"unexpected pixel format {fmt}")
+        self.w, self.h, self.stride = w, h, w * 4
+        size = self.stride * h
+        fd = os.memfd_create("t1-frame", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        os.ftruncate(fd, size)
+        self.mem = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+        self.send(REGISTER, struct.pack("<IIQ", BUFFER_ID, self.stride, size), fds=[fd])
+        os.close(fd)
+        mtype, _, payload = self.recv()
+        if mtype != ACK:
+            raise ConnectionError(f"buffer refused: {payload.hex()}")
+        log(f"connected, {w}x{h}")
+
+    def submit(self, surface):
+        surface.flush()
+        self.mem[:] = bytes(surface.get_data())
+        self.frame_id += 1
+        self.send(SUBMIT, struct.pack("<IQI", BUFFER_ID, self.frame_id, 0))
+        self.busy = True
+
+    def tap(self, key):
+        self.send(TAP, struct.pack("<B3x4H", 1, key, 0, 0, 0))
+
+
+INPUT_HEAD = struct.Struct("<QBBH")      # monotonic_ns, fn_pressed, contact_count, reserved
+CONTACT = struct.Struct("<BBBBII")       # id, tip, in_range, reserved, x, y
+
+
+def parse_input(payload):
+    """InputFrame -> (fn held, {contact id: x} for contacts touching the glass)."""
+    _, fn, count, _ = INPUT_HEAD.unpack_from(payload)
+    contacts = {}
+    for i in range(count):
+        cid, tip, _, _, x, _ = CONTACT.unpack_from(payload, INPUT_HEAD.size + CONTACT.size * i)
+        if tip:
+            contacts[cid] = x
+    return bool(fn), contacts
+
+
+def run():
+    bar = Bar()
+    bar.handshake()
+    painter = Painter(bar.w, bar.h)
+    load_config()
+    machine, agent = Machine(), Agent()
+    model = {"machine": machine, "agent": agent, "agent_status": agent.status(), "fn": False,
+             "touch_id": None, "ambient": Ambient()}
+    contacts, held, pressed, targets = {}, {}, set(), []
+    dirty, next_sample, last_second, last_spin = True, 0.0, -1, time.time()
+    spin, base = False, cairo.ImageSurface(cairo.FORMAT_RGB24, painter.w, painter.h)
+    last_dial, next_lock, dials, last_tap = 0.0, 0.0, {}, (None, 0.0)
+    last_refresh = time.time()
+    try:
+        if helper("hw") and any(f.read_text().strip() == "1"
+               for f in Path("/sys/devices/platform/applesmc.768").glob("fan*_manual")):
+            root_hw("fan-auto")                 # a previous run left max fans on
+    except OSError:
+        pass
+    sel = selectors.DefaultSelector()
+    sel.register(bar.sock, selectors.EVENT_READ)
+
+    while True:
+        now = time.time()
+        if now >= next_sample:
+            load_config()
+            machine.sample()
+            agent.sample()
+            model["agent_status"] = agent.status()
+            next_sample, dirty = now + (10 if model.get("dark") else 2), True   # idle while dark
+        t = machine.temp() if model.get("boost") or model.get("fan_boost") else None
+        if model.get("boost") and t is not None and t >= BOOST_HOT:     # too hot: boost off
+            model["boost"] = False
+            set_profile("balanced")
+            model["slot_flash"], dirty = ("cpu", "boost off: hot", now + 4), True
+        fb = model.get("fan_boost")
+        if fb and now >= fb[0] and (t is not None and t <= FAN_GOOD or now >= fb[1]):
+            model["fan_boost"] = None                                   # cooled down: SMC again
+            root_hw("fan-auto")
+            model["slot_flash"], dirty = ("thermal", "fan auto", now + 3), True
+        if model.get("relevel") and now >= model["relevel"]:    # show a dial's new level fast
+            machine.read_levels()
+            model["relevel"], dirty = None, True
+        if now >= next_lock:
+            locked, next_lock = session_locked(), now + (0.25 if model["touch_id"] else 1)
+            if locked is None:                          # unreadable: keep what was shown
+                locked = model.get("locked", False)
+            if locked != model.get("locked"):
+                model["locked"], dirty = locked, True
+        try:                                            # a screen rain pass ended
+            rm = os.stat(refresh_signal()).st_mtime if CFG.get("refresh_sign") else 0
+        except OSError:
+            rm = 0
+        if rm > last_refresh:
+            if now - rm < 3:
+                model["refresh_t0"], dirty = now, True
+            last_refresh = rm
+        if model.get("refresh_t0") and now - model["refresh_t0"] < REFRESH_S + 0.2:
+            dirty = True                                # the sign decodes at the loop's pace
+        overlay = touch_id_overlay()
+        if overlay and not model["touch_id"]:
+            model["tid_since"] = now                    # the sudo key's one blink starts
+        if now - model.get("tid_since", 0) < 2 * SUDO_BLINK + 0.1:
+            dirty = True
+        if overlay and not model["touch_id"]:           # a verify starting: is it the lock screen?
+            model["locked"], next_lock = session_locked(), now + 0.25
+        if overlay != model["touch_id"]:
+            model["touch_id"], dirty = overlay, True
+        lock_view = bool(model.get("locked") and (model["touch_id"] or not model.get("dark"))) or \
+            model.get("lock_ok_until", 0) > now - 0.3
+        anim = model.get("lock_ok_until", 0) > now
+        decoding = anim or (model.get("locked") and now - model.get("lock_since", 0) < 1.2)
+        if lock_view and now - model.get("lock_step", 0) >= (1 / 30 if decoding else 1):   # decode 30 fps, still 1
+            dirty = True                                # lock screen sign and key
+        elif agent.busy and int(now * 2) != last_second:     # pulse the working square
+            last_second, dirty = int(now * 2), True
+        if now - last_spin >= 1 / SPIN_FPS:                 # turn the fan icon with the fans
+            if machine.fan_pct:                         # 0.25 turns/s at min RPM, 2 at max
+                model["fan_angle"] = (model.get("fan_angle", 0.0) + (now - last_spin) * 2 * math.pi
+                                      * (0.25 + 1.75 * machine.fan_frac)) % (2 * math.pi)
+                spin = True
+            if machine.charging:
+                spin = True
+            last_spin = now
+
+        dark = CFG["oled_care"].get("dark_on_dpms", True) and screen_off() \
+            and now >= model.get("wake_until", 0)
+        if dark != model.get("dark", False):
+            model["dark"], dirty = dark, True
+        if dirty and not bar.busy:
+            model["defer_anim"] = True                # full frame without the fan, kept as base
+            targets = render(painter, model, pressed)
+            model["defer_anim"] = False
+            painter.surface.flush()
+            base.get_data()[:] = painter.surface.get_data()
+            draw_anim(painter, model)
+            bar.submit(painter.surface)
+            dirty = spin = False
+        elif spin and not bar.busy and model.get("fan_icon"):
+            painter.surface.get_data()[:] = base.get_data()
+            painter.surface.mark_dirty()
+            draw_anim(painter, model)
+            bar.submit(painter.surface)
+            spin = False
+
+        if model.get("refresh_t0") and now - model["refresh_t0"] < REFRESH_S + 0.2 and not held:
+            timeout = 0.033
+        elif now - model.get("tid_since", 0) < 2 * SUDO_BLINK + 0.1 and not held:
+            timeout = 0.1                               # the sudo key's blink
+        elif lock_view and not held:
+            timeout = 0.033 if model.get("lock_ok_until", 0) > now or \
+                now - model.get("lock_since", 0) < 1.2 else 0.5
+        elif model.get("dark") and not held:         # panel off: wake twice a second, for touches
+            timeout = 0.5
+        else:
+            timeout = 0.03 if held else \
+                1 / SPIN_FPS if machine.fan_pct or machine.charging else 0.2
+        for _ in sel.select(timeout=timeout):
+            mtype, rid, payload = bar.recv()
+            if mtype == FRAME_RELEASED:
+                if bar.frame_id == 1:
+                    log("first frame presented")
+                bar.busy = False
+            elif mtype == ERROR:
+                code = struct.unpack("<I", payload)[0]
+                log(f"request {rid} refused, error {code}")
+                if code in (4, 5):          # invalid / unknown buffer: give up, fall back
+                    return 1
+            elif mtype == INPUT_FRAME:
+                try:
+                    fn, now_contacts = parse_input(payload)
+                except struct.error:
+                    log(f"skipped a malformed input frame ({len(payload)} bytes)")
+                    continue
+                if fn != model["fn"]:
+                    model["fn"], dirty = fn, True
+                for cid, x in now_contacts.items():
+                    if cid in contacts:
+                        continue
+                    if model.get("dark"):            # same while the main screen is off
+                        model["wake_until"], model["dark"], dirty = time.time() + 15, False, True
+                        continue
+                    if not may_act():                # locked, or the lock state is unknown
+                        continue
+                    for tx, tw, action, name in targets:   # fire on touch-down, like stock
+                        if tx <= x < tx + tw:
+                            if action[0] == "key":
+                                bar.tap(action[1])
+                            elif action[0] == "control":
+                                run_control(action[1])
+                                model["relevel"] = time.time() + 0.25
+                            elif action[0] == "open":       # tap opens, tap again closes
+                                if not (len(action) > 2 and close_window(action[2])):
+                                    run_control(action[1])
+                            elif action[0] == "agent":
+                                open_agent()
+                            elif action[0] == "slot":
+                                due = time.time() + REPEAT_DELAY    # tap or hold: decided below
+                                if slot_action(action[1], "hold") is None and action[1] != "lock":
+                                    msg = run_action(model, slot_action(action[1], "tap"),
+                                                     time.time(), action[1])   # no hold: at once
+                                    if msg:
+                                        model["slot_flash"] = (action[1], msg, time.time() + 3)
+                                    due = 0
+                                held[cid] = (name, action, due)
+                                pressed.add(name)
+                                dirty = True
+                                break
+                            elif action[0] == "finger":         # the sensor is the input: nothing
+                                pass
+                            elif action[0] == "dial":           # tap, double tap, hold or slide
+                                dials[cid] = {"x0": x, "t0": time.time(), "slide": False}
+                                model["active_dial"] = action[1]
+                            held[cid] = (name, action, time.time() + REPEAT_DELAY)
+                            pressed.add(name)
+                            dirty = True
+                            break
+                for cid, x in now_contacts.items():     # a finger sliding on a dial
+                    action = held.get(cid, (None, (None,)))[1]
+                    d = dials.get(cid)
+                    if d and not d["slide"] and d.get("fired") is None and abs(x - d["x0"]) > DIAL_MOVE:
+                        d["slide"] = True
+                    if action[0] == "dial" and d and d["slide"] and x != contacts.get(cid) \
+                            and time.time() - last_dial >= DIAL_EVERY and may_act():
+                        set_level(machine, action[1], dial_level(action, x))
+                        last_dial, dirty = time.time(), True
+                for cid in set(held) - set(now_contacts):
+                    name, action, due = held.pop(cid)
+                    pressed.discard(name)
+                    if not may_act():               # locked since the touch began
+                        dials.pop(cid, None)
+                        dirty = True
+                        continue
+                    if action[0] == "slot" and due:             # released before the hold fired: a tap
+                        msg = run_action(model, slot_action(action[1], "tap"), time.time(), action[1])
+                        if msg:
+                            model["slot_flash"] = (action[1], msg, time.time() + 3)
+                    if action[0] == "dial":
+                        d, key = dials.pop(cid, {}), action[1]
+                        if d.get("slide"):
+                            set_level(machine, key, dial_level(action, contacts.get(cid, 0)))
+                        elif d.get("fired") is None:            # a tap
+                            hint = machine.hints.get(key) if key != "vol" else \
+                                (model["ambient"].hint() if model.get("ambient") else None)
+                            t = time.time()
+                            if key != "vol" and last_tap[0] == key and t - last_tap[1] < DOUBLE_TAP:
+                                set_level(machine, key, 1.0)            # double tap: max
+                                last_tap = (None, 0.0)
+                            else:
+                                if hint is not None:                # to the suggestion (volume: room loudness)
+                                    set_level(machine, key, hint)
+                                else:
+                                    set_level(machine, key, dial_level(action, d.get("x0", 0)))
+                                last_tap = (key, t)
+                        model["active_dial"], model["relevel"] = None, time.time() + 0.4
+                    dirty = True
+                contacts = now_contacts
+
+        # Hold to repeat, as Omarchy's repeating key bindings do
+        now = time.time()
+        for cid, (name, action, due) in list(held.items()):
+            locks = action[0] == "slot" and slot_action(action[1], "hold") == "lock"
+            if not locks and not may_act():             # nothing but locking runs while locked
+                continue
+            d = dials.get(cid)
+            if action[0] == "dial" and d and not d["slide"] and d.get("fired") is None \
+                    and now - d["t0"] >= CFG["dial_hold_seconds"]:
+                d["fired"] = True                               # hold: off, or mute
+                if action[1] == "vol":
+                    run_control(CONTROLS[6][3])
+                else:
+                    set_level(machine, action[1], 0.0, off=True)
+                model["relevel"], dirty = now + 0.3, True
+                continue
+            if action[0] == "slot" and due:
+                hold = slot_action(action[1], "hold")
+                wait = CFG["lock_hold_seconds"] if action[1] == "lock" else CFG["hold_seconds"]
+                if hold is not None and now >= due - REPEAT_DELAY + wait:
+                    message = run_action(model, hold, now, action[1])
+                    if message:
+                        model["slot_flash"] = (action[1], message, now + 3)
+                    held[cid], dirty = (name, action, 0), True      # 0 = hold fired, no tap
+                    continue
+            if action[0] == "control" and action[2] and now >= due:
+                run_control(action[1])
+                held[cid] = (name, action, now + REPEAT_EVERY)
+                model["relevel"] = now + 0.25
+
+def preview(path):
+    if cairo is None:
+        sys.exit(f"touchbar-strip: --preview needs pycairo and PyGObject ({GFX_ERROR})")
+    load_config()
+    painter = Painter(2170, 60)
+    machine, agent = Machine(), Agent()
+    machine.sample()
+    time.sleep(0.5)
+    machine.sample()
+    agent.sample()
+    model = {"machine": machine, "agent": agent, "agent_status": agent.status(),
+             "fn": "--fn" in sys.argv, "touch_id": None}
+    if "--zones" in sys.argv:
+        CFG["zones"] = [ZONE_ALIASES.get(z, z) for z in sys.argv[sys.argv.index("--zones") + 1].split(",")]
+    model["locked"] = "--locked" in sys.argv
+    if "--lockage" in sys.argv:                 # a frame this many seconds into the lock
+        model["lock_view"], model["lock_since"] = True, time.time() - float(sys.argv[sys.argv.index("--lockage") + 1])
+    if "--refresh" in sys.argv:                 # a frame of the REFRESHED sign, this many seconds in
+        CFG["refresh_sign"] = True
+        model["refresh_t0"] = time.time() - float(sys.argv[sys.argv.index("--refresh") + 1])
+    if "--unlock" in sys.argv:                  # a frame of the unlock, this many seconds in
+        t0 = time.time() - float(sys.argv[sys.argv.index("--unlock") + 1])
+        model["unlock_t0"], model["lock_ok_until"], model["lock_since"] = t0, t0 + UNLOCK_S, t0 - 5
+    if "--touch-id" in sys.argv:
+        model["touch_id"] = ("authenticate", None)
+    render(painter, model, set())
+    painter.surface.write_to_png(path)
+
+
+def check():
+    """Print the config in use, every configured action and whether what it needs is there.
+    Exit 1 when the config is refused or an action is unknown."""
+    load_config(force=True)
+    bad = 0
+    if CONFIG.exists():
+        unsafe = None
+        try:
+            unsafe = config_unsafe(CONFIG)
+            user = json.loads(CONFIG.read_text())
+            problems = validate(merged_config(user)) if isinstance(user, dict) else ["not an object"]
+        except (OSError, ValueError) as e:
+            problems = [str(e)]
+        if unsafe:
+            problems = [f"refused: {unsafe}"] + problems
+        print(f"config   {CONFIG}: {'REFUSED, using the defaults: ' + '; '.join(problems) if problems else 'ok'}")
+        bad += bool(problems)
+    else:
+        print(f"config   {CONFIG}: not there, using the defaults")
+    print(f"graphics {'ok' if cairo else f'missing ({GFX_ERROR})'}")
+    print(f"zones    {', '.join(active_zones())}")
+    a = CFG["agent"]
+    if "agent" in CFG["zones"]:
+        what = a.get("command") if a.get("provider") == "command" else \
+            f"transcripts in {CLAUDE_PROJECTS}" + (f", commits in {a['projects']}" if a.get("projects") else "")
+        print(f"agent    provider {a.get('provider')} ({what}); tap: {a.get('open')}")
+    print(f"clock    {CFG['clock'].get('timezone') or 'local time'}"
+          f"{', label ' + repr(CFG['clock'].get('label')) if CFG['clock'].get('label') is not None else ''}"
+          f"{', hour mark ' + repr(CFG['clock'].get('hour_mark')) if CFG['clock'].get('hour_mark') else ''}")
+    print(f"lock     key {'on' if CFG['lock'].get('key', True) else 'off'}, screen sign {CFG['lock'].get('screen_sign')}")
+    oc = CFG["oled_care"]
+    print(f"oled     orbit {'on' if oc.get('orbit') else 'off'}, dark while the screen is off "
+          f"{'on' if oc.get('dark_on_dpms') else 'off'}")
+    sig = refresh_signal()
+    print(f"refresh  sign {'on (' + str(sig) + ', written by omarchy-mac-kit-extras omk-rainpass)' if CFG.get('refresh_sign') else 'off'}")
+    print(f"dials    hints {'on' if CFG['dials'].get('hints', True) else 'off'}, room loudness (mic) "
+          f"{'on' if CFG['dials'].get('room_loudness') else 'off'}")
+    needs = {"hwdeck": "hwdeck", "wall": "hwdeck", "fans-max": "hw", "mem-trim": "hw",
+             "lid-mode": "lid", "lock-rain": "rainpass", "lock": "lock_cmd"}
+    for slot in SLOT_NAMES:
+        for kind in ("tap", "hold"):
+            act = slot_action(slot, kind)
+            if act is None:
+                continue
+            problem = action_problem(act)
+            if problem:
+                note, bad = f"BAD: {problem}", bad + 1
+            elif act.startswith("sh:"):
+                note = "shell command (runs as you)"
+            elif act == "charge-limit":
+                note = "ok" if os.access(CHARGE_KNOB, os.W_OK) else \
+                    "needs setup: omarchy-mac-kit module 'battery-limit' (no writable charge knob)"
+            elif act == "agent-open":
+                note = "ok"
+            else:
+                key = needs.get(act.split(":")[0])
+                if key is None:
+                    note = "ok"
+                else:
+                    found = helper(key)
+                    note = f"ok ({found})" if found else \
+                        f"needs setup: helpers.{key} = {CFG['helpers'].get(key)!r} not found" + \
+                        (f" ({NEEDS[act][1]})" if act in NEEDS else "") + \
+                        (", falls back to lock" if act == "lock-rain" else "") + \
+                        (", uses loginctl lock-session" if act == "lock" else "")
+            print(f"slot     {slot:8} {kind:4} {act:22} {note}")
+    smc = helper_file("smc_power")
+    print(f"helper   smc_power {smc}: {'present' if smc and smc.exists() else 'absent (power falls back to the battery)'}")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    if "--config" in sys.argv:
+        CONFIG = Path(os.path.expanduser(sys.argv[sys.argv.index("--config") + 1]))
+    if "--check" in sys.argv:
+        sys.exit(check())
+    if len(sys.argv) > 2 and sys.argv[1] == "--preview":
+        preview(sys.argv[2])
+        sys.exit(0)
+    if cairo is None:
+        log(f"stopping: pycairo and PyGObject are needed ({GFX_ERROR})")
+        sys.exit(1)
+    try:
+        sys.exit(run())
+    except (OSError, ConnectionError) as e:
+        log(f"stopping: {e}")
+        sys.exit(1)

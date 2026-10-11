@@ -1,0 +1,84 @@
+{
+  "zones": [
+    "clock",
+    "agent",
+    "machine"
+  ],
+  "hold_seconds": 0.8,
+  "dial_hold_seconds": 0.6,
+  "lock_hold_seconds": 0.6,
+  "font": "JetBrainsMono Nerd Font",
+  "app_id_prefix": "org.omk",
+  "clock": {
+    "timezone": null,
+    "label": null,
+    "hour_mark": "next hour in {m}m"
+  },
+  "slots": {
+    "graph": {
+      "tap": "wall",
+      "hold": null
+    },
+    "cpu": {
+      "tap": "hwdeck:cpu",
+      "hold": "cpu-boost"
+    },
+    "thermal": {
+      "tap": "hwdeck:thermal",
+      "hold": "fans-max"
+    },
+    "memory": {
+      "tap": "hwdeck:memory",
+      "hold": "mem-trim"
+    },
+    "wifi": {
+      "tap": "hwdeck:network",
+      "hold": "wifi-toggle"
+    },
+    "battery": {
+      "tap": "hwdeck:battery",
+      "hold": "charge-limit"
+    },
+    "power": {
+      "tap": "hwdeck:power",
+      "hold": "lid-mode"
+    },
+    "lock": {
+      "tap": "lock",
+      "hold": "lock"
+    }
+  },
+  "dials": {
+    "hints": true,
+    "room_loudness": true
+  },
+  "lock": {
+    "key": true,
+    "screen_sign": "matrix"
+  },
+  "oled_care": {
+    "orbit": true,
+    "dark_on_dpms": true
+  },
+  "refresh_sign": true,
+  "agent": {
+    "provider": "claude-code",
+    "projects": "~/Projects",
+    "open": "tmux-attach",
+    "progress": true,
+    "command": null
+  },
+  "helpers": {
+    "hw": "omk-hw",
+    "smc_power": "/run/omk-smc-power.json",
+    "lid": "omk-lid",
+    "lid_state": "~/.config/omk/lid-mode",
+    "rainpass": "omk-rainpass",
+    "refresh_signal": "omk-refreshed",
+    "hwdeck": "hwdeck",
+    "lock_cmd": "omarchy-system-lock",
+    "launch_tui": "omarchy-launch-or-focus-tui",
+    "terminal": null,
+    "charge_state": "/var/lib/omk-battery-limit/limit"
+  }
+}
