@@ -17,13 +17,15 @@ esc | 14:22 label | ▦ agent task / last step | CPU temp+fan RAM wifi battery p
   Built in for Claude Code; any other tool through a small script (see *Providers*).
 - **Dock** (optional, Omarchy; use it instead of the agent zone): a copy of the Mac dock in
   the strip's own look — one dark shelf with the Omarchy logo (tap = Omarchy menu, hold = apps
-  menu), pinned apps (default: Omarchy's own Terminal, Browser, Files, Editor, Music, Obsidian,
-  launched through Omarchy's `omarchy-launch-*` commands), the agent as one of them (Claude's
-  spark with the session square as its badge), then the other running apps and Omarchy's
-  workspaces (1–5 always, more when used, drawn as Omarchy's bar draws them). A dot under each
-  running app, white and a lighter plate for the app in front. Tap = bring it to the front
-  (again = the next of its windows) or launch it; hold = a new window; slide along the shelf
-  and the icons magnify and show their name, as on a Mac. Live from Hyprland's event socket.
+  menu), the pinned apps (default: your terminal, as Omarchy opens it), then every app that is
+  open, each with its own icon (its `.desktop` entry and your icon theme; Omarchy web apps
+  included) and a small white dot under it. Claude joins them while a session runs (its spark,
+  with the session square as its badge). The app in front gets a lighter plate. At the end the
+  workspaces, drawn as small screens with one cell per window: focused bright, used soft,
+  empty a faint outline (1–5 always, more while used). Tap an app = bring it to the front
+  (again = its next window) or launch it; hold = a new window. Tap a workspace = go there; hold
+  = move the window in front there without following it. Slide along the shelf and the icons
+  magnify and show their name, as on a Mac. Live from Hyprland's event socket.
 - **Machine**: a CPU graph, CPU %, temperature with a fan that spins with the fans, RAM, Wi-Fi,
   battery (coloured toward the charge limit) and power draw. Every slot has a configurable
   **tap** and **hold**.
@@ -107,10 +109,10 @@ before it locks (needs the `screensaver` module of
 | `oled_care.dark_on_dpms` | `true` | the bar goes black while the laptop's screen is off |
 | `refresh_sign` | `false` | PROCESSING → REFRESHED after a screen rain pass (reads `helpers.refresh_signal`, a file in `$XDG_RUNTIME_DIR` the extras' `omk-rainpass` touches) |
 | `agent.*` | | see *Providers* |
-| `dock.pinned` | Omarchy's apps + the agent | a list of `{"name", "icon" (a Nerd Font glyph), "color" (`text`, `blue`, `amber`, `mint`, `green`, `violet`, `red`, `ice`, `ember`, `volt`, `clay` or `[r, g, b]`), "launch" (a command, run with `sh -c`), "match" (a regex on the window class)}`, and `{"agent": true}` for the agent |
+| `dock.pinned` | the terminal | a list of `{"name", "launch" (a command, run with `sh -c`), "match" (a regex on the window class), "desktop" (the `.desktop` id whose icon to show; `"terminal"` = the one `xdg-terminal-exec` opens), "icon" (a Nerd Font glyph when there is no icon), "color"}`; `{"agent": true}` pins the agent |
+| `dock.agent` | `true` | Claude among the open apps while a session runs |
 | `dock.logo.tap` / `.hold` | `omarchy-menu toggle` / `omarchy-menu toggle apps` | commands for the Omarchy logo |
-| `dock.running` | `true` | show running apps that are not pinned |
-| `dock.workspaces` | `true` | show Omarchy's workspaces at the end |
+| `dock.workspaces` | `true` | the workspaces at the end |
 | `helpers.*` | | where the optional helpers live (below) |
 
 Slots: `graph` (the CPU graph), `cpu`, `thermal`, `memory`, `wifi`, `battery`, `power`, `lock`.
