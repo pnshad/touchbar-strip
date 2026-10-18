@@ -1846,8 +1846,9 @@ def zone_progress(p, x, w, mid, model):
 # you can slide along the dock first.
 OMARCHY_FONT, OMARCHY_LOGO = "omarchy", ""
 CLAUDE_CLAY = (0.85, 0.47, 0.34)
-DOCK_CELL, DOCK_LOGO, DOCK_WS, DOCK_RULE, DOCK_PAD = 54, 50, 58, 17, 8
-DOCK_ICON, DOCK_MAG = 30, 0.28              # icon px; how much the icon under the finger grows
+DOCK_CELL, DOCK_WS, DOCK_RULE, DOCK_PAD = 54, 58, 17, 8
+DOCK_ICON, DOCK_BIG, DOCK_MAG = 30, 42, 0.28  # icon px (open apps / logo and pins); fisheye growth
+# The logo and the pinned apps are buttons the size of the workspace screens (58 px slots)
 PALETTE = {"text": TEXT, "dim": DIM, "green": GREEN, "amber": AMBER, "red": RED, "blue": BLUE,
            "ice": ICE, "ember": EMBER, "mint": MINT, "volt": VOLT, "violet": (0.72, 0.56, 1.0),
            "clay": CLAUDE_CLAY}
@@ -2145,19 +2146,19 @@ def dock_items(dock, agent):
     d = CFG["dock"]
     prefix = (CFG.get("app_id_prefix") or DEFAULTS["app_id_prefix"]) + "."
     claude_rx = f"^{re.escape(app_id('claude'))}$"
-    items, claimed = [{"kind": "logo", "name": "Omarchy", "w": DOCK_LOGO}], set()
+    items, claimed = [{"kind": "logo", "name": "Omarchy", "w": DOCK_WS, "big": True}], set()
     pinned_agent = False
     for app in d.get("pinned") or []:
         if not isinstance(app, dict):
             continue
         if app.get("agent"):
             pinned_agent = True
-            items.append({"kind": "agent", "name": app.get("name") or "Claude", "w": DOCK_CELL,
+            items.append({"kind": "agent", "name": app.get("name") or "Claude", "w": DOCK_WS, "big": True,
                           "windows": dock.windows(claude_rx)})
             continue
         wins = dock.windows(app.get("match"))
         claimed.update(c["class"] for c in wins)
-        items.append({"kind": "app", "name": app.get("name") or "app", "w": DOCK_CELL,
+        items.append({"kind": "app", "name": app.get("name") or "app", "w": DOCK_WS, "big": True,
                       "glyph": app.get("icon"), "color": color_of(app.get("color")),
                       "entry": ICONS.entry(desktop=app["desktop"]) if app.get("desktop") else
                       ICONS.entry(cls=wins[0]["class"]) if wins else None,
@@ -2319,17 +2320,20 @@ def zone_dock(p, x, w, mid, model):
         s = 1.0
         if hover is not None and not over_ws:       # the fisheye: 1.5 cells either side
             s = 1 + DOCK_MAG * max(0.0, 1 - abs(c - hover) / (1.5 * DOCK_CELL))
-        iy = 27 + (s - 1) * 14
+            if it.get("big"):                       # already big: grow less, stay inside 60 px
+                s = 1 + (s - 1) * 0.35
+        iy = 28 + (s - 1) * 40 if it.get("big") else 27 + (s - 1) * 14   # make room for the name
         wins = it.get("windows") or []
         front = any(win.get("address") == dock.focus for win in wins)
         if front:                                   # the app in front: a lighter plate
-            pw = 46 + (s - 1) * 16
-            round_rect(cr, c - pw / 2, iy - pw / 2, pw, pw, 10)
+            pw, ph = (52, 50) if it.get("big") else (46, 46)    # big = the workspaces' plate
+            pw, ph = pw + (s - 1) * 16, ph + (s - 1) * 16
+            round_rect(cr, c - pw / 2, iy - ph / 2, pw, ph, 10)
             cr.set_source_rgb(*PLATE)
             cr.fill()
-        size = DOCK_ICON * s
+        size = (DOCK_BIG if it.get("big") else DOCK_ICON) * s
         if it["kind"] == "logo":
-            p.icon(c, iy, OMARCHY_LOGO, size=size * 0.78, color=TEXT, font=OMARCHY_FONT)
+            p.icon(c, iy, OMARCHY_LOGO, size=size * 0.84, color=TEXT, font=OMARCHY_FONT)
         elif it["kind"] == "agent":
             claude_mark(p, c, iy, size * 0.48, CLAUDE_CLAY)
             state, count = a.get("state"), a.get("count") or 0
@@ -2365,7 +2369,7 @@ def zone_dock(p, x, w, mid, model):
         name = it["name"]
         if it["kind"] == "agent" and a.get("task"):
             name = f"{name} · {a['task']}"
-        lw = 260
+        lw = min(260, 7 * len(name) + 12)           # about the name's width, so it centres on its item
         lx = min(max(x, it["x"] + it["w"] / 2 - lw / 2), x + w - lw)
         p.text(lx, 6, name, size=11, color=TEXT, width=lw, align="center")
 
