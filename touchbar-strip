@@ -172,6 +172,30 @@ DEFAULTS = {
     "wall": {"hide_bar": False},
     "agent": {"provider": "claude-code", "projects": None, "open": "tmux-attach", "progress": False,
               "command": None},
+    # The dock zone (Omarchy): the Omarchy menu, pinned apps with a dot under the running ones, the
+    # agent as one of them, other running apps, then Omarchy's workspaces. Tap = focus (cycle when
+    # it is already in front) or launch; hold = a new window; slide along it to magnify. "launch"
+    # runs as you through sh; "match" is a regex on the window class.
+    "dock": {
+        "logo": {"tap": "omarchy-menu toggle", "hold": "omarchy-menu toggle apps"},
+        "pinned": [
+            {"name": "Terminal", "icon": "", "color": "text", "launch": "omarchy-launch-terminal",
+             "match": r"^(foot|Alacritty|kitty|com\.mitchellh\.ghostty)$"},
+            {"name": "Browser", "icon": "\U000f059f", "color": "blue", "launch": "omarchy-launch-browser",
+             "match": r"^(chromium|google-chrome|brave-browser|firefox|zen)$"},
+            {"name": "Files", "icon": "\U000f024b", "color": "amber", "launch": "omarchy-launch-nautilus",
+             "match": r"^org\.gnome\.Nautilus$"},
+            {"name": "Editor", "icon": "", "color": "mint", "launch": "omarchy-launch-editor",
+             "match": r"^org\.omarchy\.(nvim|vim|hx|helix|micro|nano)$"},
+            {"name": "Music", "icon": "\U000f04c7", "color": "green", "launch": "omarchy-launch-spotify",
+             "match": r"^spotify$"},
+            {"name": "Obsidian", "icon": "\U000f082e", "color": "violet", "launch": "obsidian",
+             "match": r"^obsidian$"},
+            {"name": "Claude", "agent": True},
+        ],
+        "running": True,
+        "workspaces": True,
+    },
     "helpers": {
         "hw": "omk-hw",
         "smc_power": "/run/omk-smc-power.json",
@@ -262,6 +286,20 @@ def validate(cfg):
             ZoneInfo(tz)
         except Exception:                       # noqa: BLE001 - any failure is a bad zone
             bad.append(f"clock.timezone {tz!r} is not a known time zone")
+    dock = cfg.get("dock")
+    if not isinstance(dock, dict) or not isinstance(dock.get("pinned"), list):
+        bad.append("dock.pinned must be a list")
+    else:
+        for i, app in enumerate(dock["pinned"]):
+            if not isinstance(app, dict) or not (app.get("agent") or app.get("launch")):
+                bad.append(f"dock.pinned[{i}] needs \"launch\" (or \"agent\": true)")
+                continue
+            try:
+                re.compile(app.get("match") or "")
+            except re.error as e:
+                bad.append(f"dock.pinned[{i}].match: {e}")
+        if "dock" in (zones or []) and "agent" in (zones or []):
+            bad.append("zones: dock and agent both take the free width; use one of them")
     for name, slot in cfg.get("slots", {}).items():
         if name not in SLOT_NAMES or not isinstance(slot, dict):
             bad.append(f"slots.{name}: unknown slot (slots are {', '.join(SLOT_NAMES)})")
@@ -713,7 +751,7 @@ class Agent:
         self.busy = False
 
     def provider(self):
-        if "agent" not in CFG["zones"] and "progress" not in CFG["zones"]:
+        if not {"agent", "progress", "dock"} & set(CFG["zones"]):
             return None
         if CFG["agent"].get("provider") == "command":
             self._command = self._command or CommandProvider()
@@ -1100,12 +1138,12 @@ class Painter:
         PangoCairo.show_layout(cr, layout)
         return logical.width
 
-    def icon(self, cx, cy, s, size=30, color=TEXT, angle=0.0):
+    def icon(self, cx, cy, s, size=30, color=TEXT, angle=0.0, font=None):
         """One glyph centred on its ink, not its advance (Nerd Font icons sit off-centre),
         optionally turned by `angle` radians about that centre."""
         cr = self.cr
         layout = PangoCairo.create_layout(cr)
-        layout.set_font_description(Pango.FontDescription(f"{MONO} {size}px"))
+        layout.set_font_description(Pango.FontDescription(f"{font or MONO} {size:.1f}px"))
         layout.set_text(s, -1)
         ink, _ = layout.get_pixel_extents()
         cr.save()
@@ -1804,9 +1842,386 @@ def zone_progress(p, x, w, mid, model):
         cr.fill()
 
 
+# --- dock (Omarchy) ----------------------------------------------------------------------------
+# A copy of the Mac dock in the strip's own language: one dark shelf like the dials' plates,
+# coloured glyphs, a dot under each running app (white for the app in front, which also gets a
+# lighter plate), a thin rule before the running apps that are not pinned and another before
+# Omarchy's workspaces (1-5 always, more when used, the focused one as Omarchy's bar draws it).
+# A finger on the shelf magnifies the icon under it and its neighbours and names it above; the
+# action fires on release, so you can slide along the dock first.
+OMARCHY_FONT, OMARCHY_LOGO = "omarchy", ""
+WS_FOCUSED = "\U000f15fb"                   # the glyph Omarchy's bar shows on the focused workspace
+CLAUDE_CLAY = (0.85, 0.47, 0.34)
+DOCK_CELL, DOCK_LOGO, DOCK_WS, DOCK_RULE, DOCK_PAD = 54, 50, 26, 17, 8
+DOCK_ICON, DOCK_MAG = 25, 0.34              # icon px; how much the icon under the finger grows
+PALETTE = {"text": TEXT, "dim": DIM, "green": GREEN, "amber": AMBER, "red": RED, "blue": BLUE,
+           "ice": ICE, "ember": EMBER, "mint": MINT, "volt": VOLT, "violet": (0.72, 0.56, 1.0),
+           "clay": CLAUDE_CLAY}
+# Running apps that are not pinned: a glyph by class or title (web apps carry their site in the
+# class), else a letter tile
+KNOWN_APPS = [
+    (r"whatsapp", "\U000f05a3", GREEN), (r"youtube", "\U000f05c3", RED),
+    (r"discord", "\U000f066f", (0.45, 0.54, 0.98)), (r"moonlight", "\U000f0379", ICE),
+    (r"zoom", "\U000f0567", BLUE), (r"(^|[._-])x\.com|twitter", "\U000f0544", TEXT),
+    (r"hey\.com", "\U000f01ee", VOLT), (r"signal", "\U000f0369", BLUE),
+    (r"docker", "\U000f0868", BLUE), (r"btop|htop", "\U000f04c5", MINT),
+    (r"steam", "\U000f04d3", TEXT), (r"obs", "\U000f044a", RED), (r"localsend", "\U000f0ab8", GREEN),
+    (r"libreoffice", "\U000f0219", BLUE), (r"imv|pinta|photos", "\U000f02e9", AMBER),
+    (r"mpv", "\U000f040a", PALETTE["violet"]), (r"telegram", "\U000f0501", BLUE),
+]
+
+
+def color_of(c):
+    if isinstance(c, list) and len(c) == 3:
+        return tuple(float(v) for v in c)
+    return PALETTE.get(c, TEXT)
+
+
+def hypr_socket(name):
+    env = desktop_env()
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    return Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "hypr" / sig / name
+
+
+def hypr_json(cmd):
+    """One `hyprctl -j` request straight over Hyprland's socket (no process per call)."""
+    path = hypr_socket(".socket.sock")
+    if not path:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect(str(path))
+            s.sendall(f"j/{cmd}".encode())
+            chunks = []
+            while True:
+                b = s.recv(65536)
+                if not b:
+                    break
+                chunks.append(b)
+        return json.loads(b"".join(chunks) or b"null")
+    except (OSError, ValueError):
+        return None
+
+
+def hypr_dispatch(lua, legacy):
+    """A Hyprland dispatch in Omarchy's Lua form, the classic form when that is refused."""
+    run_control(["sh", "-c", f"hyprctl dispatch {shlex.quote(lua)} >/dev/null 2>&1 || "
+                             f"hyprctl dispatch {legacy} >/dev/null 2>&1"])
+
+
+class Dock:
+    """Windows and workspaces from Hyprland, kept fresh by its event socket (.socket2.sock): a
+    window opening, closing, moving or taking focus redraws the dock at once. Polls every 2 s
+    when the event socket is not there. Runs only while the dock zone is shown."""
+
+    EVENTS = (b"openwindow", b"closewindow", b"activewindowv2", b"workspacev2", b"movewindowv2",
+              b"createworkspacev2", b"destroyworkspacev2", b"focusedmonv2", b"activespecialv2")
+
+    def __init__(self):
+        self.clients, self.workspaces, self.active_ws, self.focus = [], {}, 1, None
+        self.order = []                         # unpinned classes, in the order they first opened
+        self.version = 0
+        self._started = False
+
+    def ensure(self):
+        if not self._started and "dock" in CFG["zones"]:
+            self._started = True
+            self.refresh()
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def refresh(self):
+        clients = hypr_json("clients")
+        if not isinstance(clients, list):
+            return
+        ws = hypr_json("workspaces") or []
+        aws = hypr_json("activeworkspace") or {}
+        clients = [c for c in clients if c.get("mapped", True) and c.get("class")]
+        focus = next((c["address"] for c in clients if c.get("focusHistoryID") == 0), None)
+        state = (clients, {w.get("id"): w.get("windows", 0) for w in ws if isinstance(w, dict)},
+                 aws.get("id", 1) if isinstance(aws, dict) else 1, focus)
+        if state != (self.clients, self.workspaces, self.active_ws, self.focus):
+            self.clients, self.workspaces, self.active_ws, self.focus = state
+            live = {c["class"] for c in clients}
+            self.order = [k for k in self.order if k in live] + \
+                [k for k in dict.fromkeys(c["class"] for c in clients) if k not in self.order]
+            self.version += 1
+
+    def _watch(self):
+        while True:
+            path = hypr_socket(".socket2.sock")
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.connect(str(path))
+                    s.settimeout(10)            # a quiet desktop: refresh anyway now and then
+                    buf = b""
+                    while True:
+                        try:
+                            data = s.recv(65536)
+                        except socket.timeout:
+                            self.refresh()
+                            continue
+                        if not data:
+                            break
+                        buf += data
+                        *lines, buf = buf.split(b"\n")
+                        if any(line.split(b">>", 1)[0] in self.EVENTS for line in lines):
+                            time.sleep(0.03)    # a burst (open + focus + move) is one refresh
+                            self.refresh()
+            except (OSError, TypeError):
+                pass
+            time.sleep(2)
+            self.refresh()
+
+    def windows(self, pattern):
+        """This app's windows, the one most recently in front first."""
+        try:
+            rx = re.compile(pattern or r"(?!)")
+        except re.error:
+            return []
+        return sorted((c for c in self.clients if rx.search(c["class"])),
+                      key=lambda c: c.get("focusHistoryID", 99))
+
+
+def dock_items(dock):
+    """What the dock shows, left to right: dicts with kind (logo, app, agent, rule, ws, more)."""
+    d = CFG["dock"]
+    prefix = (CFG.get("app_id_prefix") or DEFAULTS["app_id_prefix"]) + "."
+    items, claimed = [{"kind": "logo", "name": "Omarchy", "w": DOCK_LOGO}], set()
+    for app in d.get("pinned") or []:
+        if not isinstance(app, dict):
+            continue
+        if app.get("agent"):
+            wins = dock.windows(f"^{re.escape(app_id('claude'))}$")
+            items.append({"kind": "agent", "name": app.get("name") or "Claude", "w": DOCK_CELL,
+                          "windows": wins, "launch": None})
+            continue
+        wins = dock.windows(app.get("match"))
+        claimed.update(c["class"] for c in wins)
+        items.append({"kind": "app", "name": app.get("name") or "app", "w": DOCK_CELL,
+                      "icon": app.get("icon") or "", "color": color_of(app.get("color")),
+                      "launch": app.get("launch"), "windows": wins, "match": app.get("match")})
+    if d.get("running", True):
+        extra = []
+        for cls in dock.order:
+            if cls in claimed or cls.startswith(prefix) or cls.startswith("org.omarchy.screensaver"):
+                continue
+            wins = dock.windows(f"^{re.escape(cls)}$")
+            if not wins:
+                continue
+            name, icon, color = app_name(cls, wins[0].get("title", "")), None, None
+            hay = f"{cls} {wins[0].get('initialTitle', '')}".lower()
+            for rx, glyph, col in KNOWN_APPS:
+                if re.search(rx, hay):
+                    icon, color = glyph, col
+                    break
+            extra.append({"kind": "app", "name": name, "w": DOCK_CELL, "icon": icon,
+                          "color": color or TEXT, "launch": None, "windows": wins,
+                          "letter": None if icon else name[:1].upper()})
+        if extra:
+            items.append({"kind": "rule", "w": DOCK_RULE})
+            items.extend(extra)
+    if d.get("workspaces", True):
+        ids = sorted({1, 2, 3, 4, 5} | {i for i, n in dock.workspaces.items()
+                                         if isinstance(i, int) and 0 < i <= 10})
+        items.append({"kind": "rule", "w": DOCK_RULE})
+        items.extend({"kind": "ws", "id": i, "w": DOCK_WS, "name": f"workspace {i}",
+                      "used": dock.workspaces.get(i, 0) > 0, "focused": i == dock.active_ws}
+                     for i in ids)
+    return items
+
+
+def app_name(cls, title):
+    """A short name for a window class: chrome-app.hey.com__-Default -> Hey, a.b.Moonlight ->
+    Moonlight."""
+    m = re.match(r"(?:chrome|brave|msedge)-(?:app\.)?([^_]+)__", cls)
+    if m:
+        host = m.group(1).removeprefix("www.").removeprefix("web.").removeprefix("app.")
+        return host.split(".")[0].capitalize()
+    return cls.rsplit(".", 1)[-1].replace("-", " ").replace("_", " ").title() or title[:12]
+
+
+def claude_mark(p, cx, cy, r, color):
+    """Claude's spark drawn by hand: twelve tapered rays of two lengths around a small hub."""
+    cr = p.cr
+    cr.save()
+    cr.translate(cx, cy)
+    cr.set_source_rgb(*color)
+    for k in range(12):
+        a = k * math.pi / 6 + 0.13
+        length = r * (1.0 if k % 2 == 0 else 0.78)
+        half = 0.30
+        cr.move_to(math.cos(a - half) * r * 0.26, math.sin(a - half) * r * 0.26)
+        cr.line_to(math.cos(a - 0.05) * length, math.sin(a - 0.05) * length)
+        cr.line_to(math.cos(a + 0.05) * length, math.sin(a + 0.05) * length)
+        cr.line_to(math.cos(a + half) * r * 0.26, math.sin(a + half) * r * 0.26)
+        cr.close_path()
+    cr.fill()
+    cr.arc(0, 0, r * 0.3, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def zone_dock(p, x, w, mid, model):
+    dock = model.get("dock")
+    if dock is None:
+        return
+    items = dock_items(dock)
+    room = w - 2 * DOCK_PAD
+    while sum(i["w"] for i in items) > room:        # too many running apps: fold the last ones
+        idx = max((n for n, i in enumerate(items) if i["kind"] == "app" and i.get("launch") is None
+                   and i.get("letter", "") != "+"), default=None)
+        if idx is None:
+            break
+        more = next((i for i in items if i.get("letter") == "+"), None)
+        if more is None:
+            more = {"kind": "app", "name": "more", "w": DOCK_CELL, "icon": None, "color": DIM,
+                    "letter": "+", "launch": None, "windows": [], "folded": 0}
+            items.insert(idx + 1, more)
+        more["folded"] += 1
+        more["name"] = f"{more['folded']} more"
+        items.pop(idx)
+    total = sum(i["w"] for i in items) + 2 * DOCK_PAD
+    sx = x + max(0, (w - total) / 2)                # centred in its zone, as the Mac's
+    p.plate(sx, total, PLATE_DIAL, r=12)
+    cx, hover, h = sx + DOCK_PAD, model.get("dock_hover"), p.h
+    a = model["agent_status"]
+    model["dock_items"] = []
+    for n, it in enumerate(items):
+        it["x"] = cx
+        c = cx + it["w"] / 2
+        model["dock_items"].append(it)
+        if it["kind"] == "rule":
+            p.cr.rectangle(c, 12, 1, h - 24)
+            p.cr.set_source_rgb(0.30, 0.30, 0.32)
+            p.cr.fill()
+            cx += it["w"]
+            continue
+        model["touch"].append((cx, it["w"], ("dock", n), f"dock{n}"))
+        s = 1.0
+        if hover is not None and it["kind"] != "ws":   # the fisheye: 1.5 cells either side
+            s = 1 + DOCK_MAG * max(0.0, 1 - abs(c - hover) / (1.5 * DOCK_CELL))
+        iy = 26 + (s - 1) * 18
+        wins = it.get("windows") or []
+        front = any(win.get("address") == dock.focus for win in wins)
+        if it["kind"] == "ws":
+            col = TEXT if it["used"] or it["focused"] else tuple(v * 0.5 for v in TEXT)
+            if it["focused"]:
+                p.icon(c, mid, WS_FOCUSED, size=17, color=col)
+            else:
+                p.text(cx, mid, "0" if it["id"] == 10 else str(it["id"]), size=15, font=MONO,
+                       weight="Bold" if it["used"] else "Medium", color=col, width=it["w"],
+                       align="center")
+            cx += it["w"]
+            continue
+        if front:                                   # the app in front: a lighter plate
+            pw = 44 + (s - 1) * 14
+            rr, px, py = 10, c - pw / 2, iy - pw / 2
+            p.cr.new_sub_path()
+            p.cr.arc(px + pw - rr, py + rr, rr, -math.pi / 2, 0)
+            p.cr.arc(px + pw - rr, py + pw - rr, rr, 0, math.pi / 2)
+            p.cr.arc(px + rr, py + pw - rr, rr, math.pi / 2, math.pi)
+            p.cr.arc(px + rr, py + rr, rr, math.pi, 1.5 * math.pi)
+            p.cr.close_path()
+            p.cr.set_source_rgb(*PLATE)
+            p.cr.fill()
+        size = DOCK_ICON * s
+        if it["kind"] == "logo":
+            p.icon(c, iy, OMARCHY_LOGO, size=size * 0.92, color=TEXT, font=OMARCHY_FONT)
+        elif it["kind"] == "agent":
+            claude_mark(p, c, iy, size * 0.56, CLAUDE_CLAY)
+            state, count = a.get("state"), a.get("count") or 0
+            if count:                               # the badge: one cell per session, by state
+                col = {"waiting": BLUE, "working": GREEN, "idle": AMBER}.get(state, DIM)
+                if state == "working" and int(time.time() * 2) % 2:
+                    col = tuple(v * 0.7 for v in col)
+                bs = 15
+                bx, by = c + size * 0.28, iy - size * 0.62
+                p.cr.rectangle(bx - 2, by - 2, bs + 4, bs + 4)
+                p.cr.set_source_rgb(*(PLATE if front else PLATE_DIAL))
+                p.cr.fill()
+                count_square(p, bx, by + bs / 2, count, col, size=bs, line=1.5)
+        elif it.get("letter"):                      # an app with no glyph: a letter tile
+            t = size + 1
+            p.cr.rectangle(c - t / 2, iy - t / 2, t, t)
+            p.cr.set_source_rgb(*PLATE)
+            p.cr.fill()
+            p.text(c - t / 2, iy, it["letter"], size=size * 0.62, weight="Bold", font=MONO,
+                   color=it["color"], width=t, align="center")
+        else:
+            p.icon(c, iy, it["icon"], size=size, color=it["color"])
+        if wins:                                    # running: a dot, white for the app in front
+            p.dot(c, h - 5, 2.3, TEXT if front else SOFT)
+        cx += it["w"]
+    # The name of what is under the finger, above its icon (the Mac's tooltip)
+    if hover is not None:
+        it = next((i for i in model["dock_items"] if i["kind"] != "rule"
+                   and i["x"] <= hover < i["x"] + i["w"]), None)
+        if it:
+            name = it["name"]
+            if it["kind"] == "agent" and a.get("task"):
+                name = f"{name} · {a['task']}"
+            lw = 240
+            lx = min(max(x, it["x"] + it["w"] / 2 - lw / 2), x + w - lw)
+            p.text(lx, 7, name, size=11, color=TEXT, width=lw, align="center")
+
+
+def dock_hit(model, x):
+    if x is None:
+        return None
+    return next((i for i in model.get("dock_items") or []
+                 if i["kind"] != "rule" and i["x"] <= x < i["x"] + i["w"]), None)
+
+
+def dock_tap(model, it):
+    """Release on an item: the Omarchy menu; an app to the front (the next of its windows when it
+    is already there) or launched; a workspace; the agent's window."""
+    if it is None:
+        return
+    dock = model["dock"]
+    if it["kind"] == "logo":
+        cmd = (CFG["dock"].get("logo") or {}).get("tap")
+        if cmd:
+            run_control(["sh", "-c", cmd])
+    elif it["kind"] == "ws":
+        i = it["id"]
+        hypr_dispatch(f'hl.dsp.focus({{ workspace = "{i}" }})', f"workspace {i}")
+    elif it["kind"] == "agent":
+        open_agent()
+    elif it["kind"] == "app":
+        wins = it.get("windows") or []
+        if wins:
+            front = wins[0].get("address") == dock.focus
+            target = wins[-1] if front and len(wins) > 1 else wins[0]   # cycle when in front
+            addr = target["address"]
+            hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})', f"focuswindow address:{addr}")
+        elif it.get("launch"):
+            run_control(["sh", "-c", it["launch"]])
+    threading.Timer(0.3, dock.refresh).start()
+
+
+def dock_hold(model, it):
+    """A hold: a new window of a pinned app, a new agent session, the logo's second menu."""
+    if it is None:
+        return
+    if it["kind"] == "logo":
+        cmd = (CFG["dock"].get("logo") or {}).get("hold")
+        if cmd:
+            run_control(["sh", "-c", cmd])
+    elif it["kind"] == "app" and it.get("launch"):
+        run_control(["sh", "-c", it["launch"]])
+    elif it["kind"] == "agent":
+        where = os.path.expanduser(CFG["agent"].get("projects") or "~")
+        cmd = ["bash", "-lc", f"cd {shlex.quote(where)} && exec claude"]
+        new = shutil.which("omarchy-launch-tui", path=desktop_env().get("PATH"))   # never focuses
+        run_control([new, f"--app-id={app_id('claude')}"] + cmd if new else launch_tui(app_id("claude"), cmd))
+
+
 ZONE_DRAW = {"clock": zone_clock, "agent": zone_agent, "progress": zone_progress,
-             "machine": zone_machine}
-ZONE_WIDTH = {"clock": 228, "agent": None, "progress": 270, "machine": 532}   # None = flexible
+             "machine": zone_machine, "dock": zone_dock}
+ZONE_WIDTH = {"clock": 228, "agent": None, "progress": 270, "machine": 532, "dock": None}   # None = flexible
 
 
 def active_zones():
@@ -2131,8 +2546,8 @@ def run():
     load_config()
     machine, agent = Machine(), Agent()
     model = {"machine": machine, "agent": agent, "agent_status": agent.status(), "fn": False,
-             "touch_id": None, "ambient": Ambient()}
-    contacts, held, pressed, targets = {}, {}, set(), []
+             "touch_id": None, "ambient": Ambient(), "dock": Dock()}
+    contacts, held, pressed, targets, docked = {}, {}, set(), [], {}
     dirty, next_sample, last_second, last_spin = True, 0.0, -1, time.time()
     spin, base = False, cairo.ImageSurface(cairo.FORMAT_RGB24, painter.w, painter.h)
     last_dial, next_lock, dials, last_tap = 0.0, 0.0, {}, (None, 0.0)
@@ -2154,7 +2569,10 @@ def run():
             machine.sample()
             agent.sample()
             model["agent_status"] = agent.status()
+            model["dock"].ensure()
             next_sample, dirty = now + (10 if model.get("dark") else 2), True   # idle while dark
+        if model["dock"].version != model.get("dock_seen"):     # a window opened, closed, moved
+            model["dock_seen"], dirty = model["dock"].version, True
         t = machine.temp() if model.get("boost") or model.get("fan_boost") else None
         if model.get("boost") and t is not None and t >= BOOST_HOT:     # too hot: boost off
             model["boost"] = False
@@ -2293,6 +2711,10 @@ def run():
                                 pressed.add(name)
                                 dirty = True
                                 break
+                            elif action[0] == "dock":           # magnify now, act on release
+                                docked[cid] = {"x0": x, "x": x, "t0": time.time(), "slide": False,
+                                               "fired": False}
+                                model["dock_hover"] = x
                             elif action[0] == "finger":         # the sensor is the input: nothing
                                 pass
                             elif action[0] == "dial":           # tap, double tap, hold or slide
@@ -2302,6 +2724,11 @@ def run():
                             pressed.add(name)
                             dirty = True
                             break
+                for cid, x in now_contacts.items():     # a finger sliding along the dock
+                    d = docked.get(cid)
+                    if d and x != d["x"]:
+                        d["x"], model["dock_hover"], dirty = x, x, True
+                        d["slide"] = d["slide"] or abs(x - d["x0"]) > DIAL_MOVE
                 for cid, x in now_contacts.items():     # a finger sliding on a dial
                     action = held.get(cid, (None, (None,)))[1]
                     d = dials.get(cid)
@@ -2316,8 +2743,16 @@ def run():
                     pressed.discard(name)
                     if not may_act():               # locked since the touch began
                         dials.pop(cid, None)
+                        docked.pop(cid, None)
+                        model["dock_hover"] = None if not docked else model.get("dock_hover")
                         dirty = True
                         continue
+                    if action[0] == "dock":
+                        d = docked.pop(cid, None)
+                        if d and not d["fired"]:
+                            dock_tap(model, dock_hit(model, d["x"]))
+                        if not docked:
+                            model["dock_hover"] = None
                     if action[0] == "slot" and due:             # released before the hold fired: a tap
                         msg = run_action(model, slot_action(action[1], "tap"), time.time(), action[1])
                         if msg:
@@ -2359,6 +2794,12 @@ def run():
                     set_level(machine, action[1], 0.0, off=True)
                 model["relevel"], dirty = now + 0.3, True
                 continue
+            d = docked.get(cid)
+            if action[0] == "dock" and d and not d["fired"] and not d["slide"] \
+                    and now - d["t0"] >= CFG["hold_seconds"]:
+                d["fired"], dirty = True, True                  # hold: a new window
+                dock_hold(model, dock_hit(model, d["x"]))
+                continue
             if action[0] == "slot" and due:
                 hold = slot_action(action[1], "hold")
                 wait = CFG["lock_hold_seconds"] if action[1] == "lock" else CFG["hold_seconds"]
@@ -2384,7 +2825,8 @@ def preview(path):
     machine.sample()
     agent.sample()
     model = {"machine": machine, "agent": agent, "agent_status": agent.status(),
-             "fn": "--fn" in sys.argv, "touch_id": None}
+             "fn": "--fn" in sys.argv, "touch_id": None, "dock": Dock()}
+    model["dock"].refresh()
     if "--zones" in sys.argv:
         CFG["zones"] = [ZONE_ALIASES.get(z, z) for z in sys.argv[sys.argv.index("--zones") + 1].split(",")]
     model["locked"] = "--locked" in sys.argv
@@ -2398,6 +2840,9 @@ def preview(path):
         model["unlock_t0"], model["lock_ok_until"], model["lock_since"] = t0, t0 + UNLOCK_S, t0 - 5
     if "--touch-id" in sys.argv:
         model["touch_id"] = ("authenticate", None)
+    if "--hover" in sys.argv:                   # a finger on the dock at this x
+        render(Painter(2170, 60), model, set())     # lay the dock out once, then draw it magnified
+        model["dock_hover"] = float(sys.argv[sys.argv.index("--hover") + 1])
     render(painter, model, set())
     painter.surface.write_to_png(path)
 
@@ -2428,6 +2873,16 @@ def check():
         what = a.get("command") if a.get("provider") == "command" else \
             f"transcripts in {CLAUDE_PROJECTS}" + (f", commits in {a['projects']}" if a.get("projects") else "")
         print(f"agent    provider {a.get('provider')} ({what}); tap: {a.get('open')}")
+    if "dock" in CFG["zones"]:
+        path = desktop_env().get("PATH")
+        for app in CFG["dock"].get("pinned") or []:
+            if app.get("agent"):
+                print(f"dock     {app.get('name') or 'Claude':9} the agent (tap: {a.get('open')})")
+                continue
+            prog = (shlex.split(app.get("launch") or "") or [""])[0]
+            print(f"dock     {app.get('name', '?'):9} {app.get('launch')}: "
+                  f"{'ok' if shutil.which(prog, path=path) else 'NOT FOUND (tap focuses only)'}")
+        print(f"dock     socket {hypr_socket('.socket2.sock') or 'no Hyprland session found'}")
     print(f"clock    {CFG['clock'].get('timezone') or 'local time'}"
           f"{', label ' + repr(CFG['clock'].get('label')) if CFG['clock'].get('label') is not None else ''}"
           f"{', hour mark ' + repr(CFG['clock'].get('hour_mark')) if CFG['clock'].get('hour_mark') else ''}")

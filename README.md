@@ -15,6 +15,15 @@ esc | 14:22 label | ▦ agent task / last step | CPU temp+fan RAM wifi battery p
 - **Agent** (optional): a coding agent's state as a square cut into one cell per session —
   green working, blue waiting for you, amber idle, grey none — plus its task and latest step.
   Built in for Claude Code; any other tool through a small script (see *Providers*).
+- **Dock** (optional, Omarchy; use it instead of the agent zone): a copy of the Mac dock in
+  the strip's own look — one dark shelf with the Omarchy logo (tap = Omarchy menu, hold = apps
+  menu), pinned apps (default: Omarchy's own Terminal, Browser, Files, Editor, Music, Obsidian,
+  launched through Omarchy's `omarchy-launch-*` commands), the agent as one of them (Claude's
+  spark with the session square as its badge), then the other running apps and Omarchy's
+  workspaces (1–5 always, more when used, drawn as Omarchy's bar draws them). A dot under each
+  running app, white and a lighter plate for the app in front. Tap = bring it to the front
+  (again = the next of its windows) or launch it; hold = a new window; slide along the shelf
+  and the icons magnify and show their name, as on a Mac. Live from Hyprland's event socket.
 - **Machine**: a CPU graph, CPU %, temperature with a fan that spins with the fans, RAM, Wi-Fi,
   battery (coloured toward the charge limit) and power draw. Every slot has a configurable
   **tap** and **hold**.
@@ -81,7 +90,7 @@ before it locks (needs the `screensaver` module of
 
 | Key | Default | Meaning |
 |---|---|---|
-| `zones` | `["clock", "agent", "machine"]` | which zones, in order; also `progress` |
+| `zones` | `["clock", "agent", "machine"]` | which zones, in order; also `progress`, `dock` (instead of `agent`) |
 | `hold_seconds` | `0.8` | how long a touch on a slot counts as a hold |
 | `dial_hold_seconds`, `lock_hold_seconds` | `0.6` | the same for the dials and the lock key |
 | `font` | `JetBrainsMono Nerd Font` | icon and digit font |
@@ -98,6 +107,10 @@ before it locks (needs the `screensaver` module of
 | `oled_care.dark_on_dpms` | `true` | the bar goes black while the laptop's screen is off |
 | `refresh_sign` | `false` | PROCESSING → REFRESHED after a screen rain pass (reads `helpers.refresh_signal`, a file in `$XDG_RUNTIME_DIR` the extras' `omk-rainpass` touches) |
 | `agent.*` | | see *Providers* |
+| `dock.pinned` | Omarchy's apps + the agent | a list of `{"name", "icon" (a Nerd Font glyph), "color" (`text`, `blue`, `amber`, `mint`, `green`, `violet`, `red`, `ice`, `ember`, `volt`, `clay` or `[r, g, b]`), "launch" (a command, run with `sh -c`), "match" (a regex on the window class)}`, and `{"agent": true}` for the agent |
+| `dock.logo.tap` / `.hold` | `omarchy-menu toggle` / `omarchy-menu toggle apps` | commands for the Omarchy logo |
+| `dock.running` | `true` | show running apps that are not pinned |
+| `dock.workspaces` | `true` | show Omarchy's workspaces at the end |
 | `helpers.*` | | where the optional helpers live (below) |
 
 Slots: `graph` (the CPU graph), `cpu`, `thermal`, `memory`, `wifi`, `battery`, `power`, `lock`.
@@ -175,7 +188,7 @@ Leave `agent` out of `zones` and no transcript is read and no command runs.
 ```
 touchbar-strip                         run (t1bridge starts it)
 touchbar-strip --check [--config F]    the config in use and every action's status; exit 1 on errors
-touchbar-strip --preview OUT.png [--fn] [--locked] [--lockage S] [--unlock S] [--refresh S] [--touch-id] [--zones a,b]
+touchbar-strip --preview OUT.png [--fn] [--locked] [--lockage S] [--unlock S] [--refresh S] [--touch-id] [--zones a,b] [--hover X]
 ```
 
 ## Licence
