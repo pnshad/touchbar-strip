@@ -419,7 +419,7 @@ class Machine:
     def __init__(self):
         self.cpu = deque([0.0] * 60, maxlen=60)
         self._last = None
-        self.fan_pct, self.fan_frac, self.charging = None, 0.0, False
+        self.fan_pct, self.fan_frac, self.charging, self.drain = None, 0.0, False, None
         self.levels = {}
         self.hints = {}
 
@@ -435,6 +435,32 @@ class Machine:
         self.fan_pct, self.fan_frac = fan if fan else (None, 0.0)
         self.read_levels()
         self.charging = self.battery()[1] == "Charging"
+        self._sample_drain()
+
+    def _sample_drain(self):
+        """The battery's drain, smoothed (each 2 s sample counts 1/20, so about a minute of
+        history): a burst of load does not swing the time left. Forgotten on AC."""
+        b = Path("/sys/class/power_supply/BAT0")
+        try:
+            status = (b / "status").read_text().strip()
+            amps = int((b / "current_now").read_text())
+        except (OSError, ValueError):
+            self.drain = None
+            return
+        if status != "Discharging" or amps <= 0 or self.on_ac():
+            self.drain = None
+            return
+        prev = getattr(self, "drain", None)
+        self.drain = amps if prev is None else prev + (amps - prev) / 20
+
+    def time_left(self):
+        """Hours until empty on battery (charge now / smoothed current), or None."""
+        if not getattr(self, "drain", None):
+            return None
+        try:
+            return int(Path("/sys/class/power_supply/BAT0/charge_now").read_text()) / self.drain
+        except (OSError, ValueError):
+            return None
 
     @staticmethod
     def temp():
@@ -1471,7 +1497,10 @@ def zone_machine(p, x, w, mid, model):
         label = flash[1] if flash and flash[0] == "battery" else f"max {m.charge_limit()}" \
             if m.charge_limit() < 100 else "bat"
         p.text(x + 15, mid - 11, label, size=12, color=TEXT if flash and flash[0] == "battery" else DIM)
-        p.text(x, mid + 10, f"{cap}%", size=17, font=MONO,
+        # On power: the charge %. Unplugged: the time left (3.5h, or 40m under an hour)
+        left = None if m.on_ac() else m.time_left()
+        value = f"{cap}%" if left is None else f"{left:.1f}h" if left >= 1 else f"{max(1, round(left * 60))}m"
+        p.text(x, mid + 10, value, size=17, font=MONO,
                color=RED if cap < 15 and not m.on_ac() else TEXT)
     x += 70
     # Power: what the machine draws: the SMC's whole-system watts when a reader publishes them,
@@ -1846,9 +1875,10 @@ def zone_progress(p, x, w, mid, model):
 # you can slide along the dock first.
 OMARCHY_FONT, OMARCHY_LOGO = "omarchy", ""
 CLAUDE_CLAY = (0.85, 0.47, 0.34)
-DOCK_CELL, DOCK_WS, DOCK_RULE, DOCK_PAD = 54, 58, 17, 8
-DOCK_ICON, DOCK_BIG, DOCK_MAG = 30, 42, 0.28  # icon px (open apps / logo and pins); fisheye growth
-# The logo and the pinned apps are buttons the size of the workspace screens (58 px slots)
+# One slot for everything on the shelf, the workspace screens' width; the biggest icon the
+# 60 px bar holds, and the pressed size (Loewy L-024)
+DOCK_CELL, DOCK_WS, DOCK_RULE, DOCK_PAD = 58, 58, 17, 8
+DOCK_ICON, DOCK_PRESSED = 46, 38
 PALETTE = {"text": TEXT, "dim": DIM, "green": GREEN, "amber": AMBER, "red": RED, "blue": BLUE,
            "ice": ICE, "ember": EMBER, "mint": MINT, "volt": VOLT, "violet": (0.72, 0.56, 1.0),
            "clay": CLAUDE_CLAY}
@@ -2146,19 +2176,19 @@ def dock_items(dock, agent):
     d = CFG["dock"]
     prefix = (CFG.get("app_id_prefix") or DEFAULTS["app_id_prefix"]) + "."
     claude_rx = f"^{re.escape(app_id('claude'))}$"
-    items, claimed = [{"kind": "logo", "name": "Omarchy", "w": DOCK_WS, "big": True}], set()
+    items, claimed = [{"kind": "logo", "name": "Omarchy", "w": DOCK_WS}], set()
     pinned_agent = False
     for app in d.get("pinned") or []:
         if not isinstance(app, dict):
             continue
         if app.get("agent"):
             pinned_agent = True
-            items.append({"kind": "agent", "name": app.get("name") or "Claude", "w": DOCK_WS, "big": True,
+            items.append({"kind": "agent", "name": app.get("name") or "Claude", "w": DOCK_WS,
                           "windows": dock.windows(claude_rx)})
             continue
         wins = dock.windows(app.get("match"))
         claimed.update(c["class"] for c in wins)
-        items.append({"kind": "app", "name": app.get("name") or "app", "w": DOCK_WS, "big": True,
+        items.append({"kind": "app", "name": app.get("name") or "app", "w": DOCK_WS,
                       "glyph": app.get("icon"), "color": color_of(app.get("color")),
                       "entry": ICONS.entry(desktop=app["desktop"]) if app.get("desktop") else
                       ICONS.entry(cls=wins[0]["class"]) if wins else None,
@@ -2317,51 +2347,41 @@ def zone_dock(p, x, w, mid, model):
                              "focused" if it["focused"] else "used" if it["windows_n"] else "empty")
             cx += it["w"]
             continue
-        s = 1.0
-        if hover is not None and not over_ws:       # the fisheye: 1.5 cells either side
-            s = 1 + DOCK_MAG * max(0.0, 1 - abs(c - hover) / (1.5 * DOCK_CELL))
-            if it.get("big"):                       # already big: grow less, stay inside 60 px
-                s = 1 + (s - 1) * 0.35
-        iy = 28 + (s - 1) * 40 if it.get("big") else 27 + (s - 1) * 14   # make room for the name
+        # At rest the biggest icon the bar holds; under the finger it goes down like a key, a
+        # little smaller, on the lighter plate, and its name takes the room above (Loewy L-024)
+        size, iy = (DOCK_PRESSED, 33) if under else (DOCK_ICON, 28)
         wins = it.get("windows") or []
         front = any(win.get("address") == dock.focus for win in wins)
-        if front:                                   # the app in front: a lighter plate
-            pw, ph = (52, 50) if it.get("big") else (46, 46)    # big = the workspaces' plate
-            pw, ph = pw + (s - 1) * 16, ph + (s - 1) * 16
-            round_rect(cr, c - pw / 2, iy - ph / 2, pw, ph, 10)
+        if front or under:                          # in front, or under the finger: the plate
+            round_rect(cr, c - 26, 3, 52, 50, 10)
             cr.set_source_rgb(*PLATE)
             cr.fill()
-        size = (DOCK_BIG if it.get("big") else DOCK_ICON) * s
         if it["kind"] == "logo":
-            p.icon(c, iy, OMARCHY_LOGO, size=size * 0.84, color=TEXT, font=OMARCHY_FONT)
+            p.icon(c, iy, OMARCHY_LOGO, size=size * 0.9, color=TEXT, font=OMARCHY_FONT)
         elif it["kind"] == "agent":
-            claude_mark(p, c, iy, size * 0.48, CLAUDE_CLAY)
+            claude_mark(p, c, iy, size * 0.46, CLAUDE_CLAY)
             state, count = a.get("state"), a.get("count") or 0
             if count:                               # the badge: one cell per session, by state
                 col = {"waiting": BLUE, "working": GREEN, "idle": AMBER}.get(state, DIM)
                 if state == "working" and int(time.time() * 2) % 2:
                     col = tuple(v * 0.7 for v in col)
                 bs = 15
-                bx, by = c + size * 0.22, iy - size * 0.55
+                bx, by = c + size * 0.22, iy - size * 0.5
                 cr.rectangle(bx - 2, by - 2, bs + 4, bs + 4)
-                cr.set_source_rgb(*(PLATE if front else PLATE_DIAL))
+                cr.set_source_rgb(*(PLATE if front or under else PLATE_DIAL))
                 cr.fill()
                 count_square(p, bx, by + bs / 2, count, col, size=bs, line=1.5)
-            if count:
-                wins = wins or [{}]                 # sessions running: a dot, window or not
         elif ICONS.draw(p, it.get("entry"), c, iy, size):
             pass                                    # its own icon
         elif it.get("glyph"):
-            p.icon(c, iy, it["glyph"], size=size * 0.85, color=it["color"])
+            p.icon(c, iy, it["glyph"], size=size * 0.9, color=it["color"])
         else:                                       # no icon at all: a letter tile
-            t = size * 0.85
+            t = size * 0.87
             round_rect(cr, c - t / 2, iy - t / 2, t, t, 6)
             cr.set_source_rgb(*PLATE)
             cr.fill()
             p.text(c - t / 2, iy, it.get("letter") or "?", size=t * 0.62, weight="Bold", font=MONO,
                    color=it.get("color", TEXT), width=t, align="center")
-        if wins:                                    # running: the small white dot
-            p.dot(c, h - 4.5, 2.3, TEXT)
         cx += it["w"]
     # The name of what is under the finger, above it (the Mac's tooltip)
     it = dock_hit(model, hover)
@@ -2371,7 +2391,7 @@ def zone_dock(p, x, w, mid, model):
             name = f"{name} · {a['task']}"
         lw = min(260, 7 * len(name) + 12)           # about the name's width, so it centres on its item
         lx = min(max(x, it["x"] + it["w"] / 2 - lw / 2), x + w - lw)
-        p.text(lx, 6, name, size=11, color=TEXT, width=lw, align="center")
+        p.text(lx, 7, name, size=11, color=TEXT, width=lw, align="center")
 
 
 def dock_hit(model, x):

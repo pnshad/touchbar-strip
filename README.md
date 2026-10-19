@@ -19,15 +19,16 @@ esc | 14:22 label | ▦ agent task / last step | CPU temp+fan RAM wifi battery p
   the strip's own look — one dark shelf with the Omarchy logo (tap = Omarchy menu, hold = apps
   menu), the pinned apps (default: your terminal, as Omarchy opens it), then every app that is
   open, each with its own icon (its `.desktop` entry and your icon theme; Omarchy web apps
-  included) and a small white dot under it. Claude joins them while a session runs (its spark,
+  included), as big as the bar holds. Claude joins them while a session runs (its spark,
   with the session square as its badge). The app in front gets a lighter plate. At the end the
   workspaces, drawn as small screens with one cell per window: focused bright, used soft,
   empty a faint outline (1–5 always, more while used). Tap an app = bring it to the front
   (again = its next window) or launch it; hold = a new window. Tap a workspace = go there; hold
-  = move the window in front there without following it. Slide along the shelf and the icons
-  magnify and show their name, as on a Mac. Live from Hyprland's event socket.
+  = move the window in front there without following it. A finger on an icon presses it like a
+  key (it steps down onto a lighter plate and its name shows above); slide along the shelf,
+  and release to act. Live from Hyprland's event socket.
 - **Machine**: a CPU graph, CPU %, temperature with a fan that spins with the fans, RAM, Wi-Fi,
-  battery (coloured toward the charge limit) and power draw. Every slot has a configurable
+  battery (coloured toward the charge limit; the charge % on power, the time left — 3.5h — unplugged) and power draw. Every slot has a configurable
   **tap** and **hold**.
 - **Dials**: screen and keyboard backlight and volume as ring dials. Slide to set; tap a
   backlight to go to the light sensor's suggestion, double-tap for max, hold for off; hold
